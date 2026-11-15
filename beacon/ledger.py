@@ -61,7 +61,10 @@ CHOICE_RULE = ("effectiveness first, then cost: take the option most likely to r
                "chances, take the cheaper one")
 HUMAN_PICK = 100      # priority of a node the human picked (`beacon: pick`): it goes before everything
 DECIDER_TOP = 60      # the decider's first choice; its ranking counts down from here (below a human pick)
-ACTORS = ("worker", "lighthouse", "human", "gate", "verifier", "checklist", "decider")
+ACTORS = ("worker", "lighthouse", "human", "gate", "verifier", "checklist", "decider", "orchestrator")
+# Who may act as the human: the human, or an orchestrator the human delegated to (ccbridge, driving runs
+# from a Claude session in the Claude app). Recorded under its own actor so the hash chain tells them apart.
+HUMAN_ACTORS = ("human", "orchestrator")
 
 MIN_REASON = 8          # characters; a one-word reason is not a reason
 MAX_TEXT = 4000         # per free-text field
@@ -157,7 +160,7 @@ DEFAULT_GATE = {
 
 
 def _closed_problem_msg(pid, status, actor):
-    if actor == "human":
+    if actor in HUMAN_ACTORS:
         return f"problem {pid} is {status}: reopen it first (`beacon: reopen {pid} [note]`), or add the idea under an open problem"
     return (f"problem {pid} is {status}: new work goes under an open problem, or propose_problem for work that is "
             "its own")
@@ -764,7 +767,7 @@ class Ledger:
 
     def pick(self, node_id, actor="human"):
         """The human chooses which open node is taken next (`beacon: pick`)."""
-        if actor != "human":
+        if actor not in HUMAN_ACTORS:
             raise LedgerError("only the human picks")
         n = self.node(node_id)
         if n["kind"] == "problem":
@@ -823,7 +826,7 @@ class Ledger:
             cur.execute("UPDATE nodes SET status=?, reason=?, assumption=?, superseded_by=?,"
                         " updated_seq=? WHERE id=?",
                         (status, _clip(reason), _clip(assumption), superseded_by, seq, node_id))
-            if counts_as_progress and actor in ("worker", "verifier", "human"):
+            if counts_as_progress and actor in ("worker", "verifier") + HUMAN_ACTORS:
                 self._bump(cur, "progress")
             return {"id": node_id, "from": n["status"], "to": status, "reason": reason,
                     "assumption": assumption, "evidence": list(evidence_ids)}
@@ -877,7 +880,7 @@ class Ledger:
         return run_verify(cmd, candidate, self.workdir(), int(self.config()["verify_timeout"]))
 
     def verify(self, problem_id, accept, note="", actor="human"):
-        if actor not in ("human", "verifier"):
+        if actor not in HUMAN_ACTORS + ("verifier",):
             raise LedgerError("only the human or the verifier can verify a problem")
         p = self.node(problem_id)
         if p["status"] != "pending_verification":
@@ -910,7 +913,7 @@ class Ledger:
         """The human declares a problem done without (or against) its verify command -- the way past a wrong
         command, which otherwise keeps a problem out of pending_verification for good (propose_done runs it at
         once). From in_progress, blocked or pending_verification; the reason is required and recorded."""
-        if actor != "human":
+        if actor not in HUMAN_ACTORS:
             raise LedgerError("only the human can force a verification")
         p = self.node(problem_id)
         if p["kind"] != "problem":
@@ -930,7 +933,7 @@ class Ledger:
 
     def set_verify_cmd(self, problem_id, cmd, actor="human"):
         """The human replaces a problem's verify command (a wrong one cannot be passed otherwise)."""
-        if actor != "human":
+        if actor not in HUMAN_ACTORS:
             raise LedgerError("only the human can change a verify command")
         p = self.node(problem_id)
         if p["kind"] != "problem":
@@ -1039,7 +1042,7 @@ class Ledger:
         return self._mutate(actor, "approved", apply)
 
     def answer(self, qid, text, actor="human"):
-        if actor != "human":
+        if actor not in HUMAN_ACTORS:
             raise LedgerError("only the human answers questions")
         row = self.db.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
         if row is None:
@@ -1105,7 +1108,7 @@ class Ledger:
         return self._mutate(actor, "propose_problem", apply)
 
     def accept_problem(self, problem_id, accept=True, note="", actor="human"):
-        if actor != "human":
+        if actor not in HUMAN_ACTORS:
             raise LedgerError("only the human accepts or rejects a proposed problem")
         p = self.node(problem_id)
         if p["kind"] != "problem" or p["status"] != "proposed":
@@ -1176,7 +1179,7 @@ class Ledger:
         return self._mutate(actor, "followup_problem", apply)["id"]
 
     def reopen(self, node_id, note="", actor="human"):
-        if actor != "human":
+        if actor not in HUMAN_ACTORS:
             raise LedgerError("only the human reopens a node")
         n = self.node(node_id)
         new = "in_progress" if n["kind"] == "problem" else "todo"
@@ -1243,7 +1246,7 @@ class Ledger:
         return dict(self._meta_get("human", {}) or {})
 
     def set_human_flag(self, key, value, actor="human"):
-        if actor != "human":
+        if actor not in HUMAN_ACTORS:
             raise LedgerError("only the human sets this")
         if key not in self.HUMAN_FLAGS:
             raise LedgerError(f"unknown flag {key!r}")

@@ -336,6 +336,11 @@ python3 -m beacon watch --run ~/beacon-runs/fo13 --cwd ~/ctf/fo13          # run
   running as your user (it could fake a terminal or write the database with its own code):
   every human action is an event in the hash chain (`chat_command` / `chat_answer` mark the
   chat ones), so the record shows it.
+- **An orchestrator acting for the human.** ccbridge (a Claude session in the Claude app driving beacon
+  runs for you) answers questions, verifies candidates and reopens or picks nodes through the ledger API as
+  actor `orchestrator` (`HUMAN_ACTORS` in `ledger.py`): it may do what the human does, and the hash chain
+  records it under its own name, so `orchestrator` events are never mistaken for yours. The CLI's human
+  commands still need a terminal and still act as `human`.
 - **Tamper-evident, not tamper-proof.** The worker runs as your OS user. The PreToolUse
   guard blocks the obvious routes (Write/Edit into the run dir or the beacon package,
   Bash commands naming the ledger, `.claude/settings*`, `.mcp.json`); the state digest

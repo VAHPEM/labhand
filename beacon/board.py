@@ -215,6 +215,7 @@ function row(n){
   if (D.next === n.id) r.append(el("span", "tag next", "▶ next"));
   if (n.source === "lighthouse") r.append(el("span", "tag lh", "✦ lighthouse"));
   if (n.source === "human") r.append(el("span", "tag hu", "● you"));
+  else if (n.source === "orchestrator") r.append(el("span", "tag hu", "◆ orchestrator"));
   if (n.source === "followup") r.append(el("span", "tag fu", "↻ left unfinished"));
   if (n.priority >= 100 && !CLOSED.has(n.status)) r.append(el("span", "tag hu", "★ your pick"));
   if (D.decisions.some(d => d.order[0] === n.id)) r.append(el("span", "tag lh", "⚖ decider's choice"));
