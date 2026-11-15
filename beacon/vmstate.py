@@ -68,8 +68,7 @@ def host_os(host):
 
 
 def labhand_runner(script, host, kind):
-    """Default runner: labhand.shell.run_script (imported lazily; needs the lab). No dualvm
-    fallback: dualvm is a shim over labhand, so it fails whenever labhand does."""
+    """Default runner: labhand.shell.run_script (imported lazily; needs the lab)."""
     from labhand import shell
     r = shell.run_script(script, host=host, kind=kind, timeout=60)
     return bool(r.ok), r.detail or r.summary or ""

@@ -201,3 +201,26 @@ def test_pool_key_is_the_inventory_name(inv, monkeypatch):
     a = remote._get("WinBox")
     b = remote._get("winbox")
     assert a is b and made == [("10.0.0.2", "u2")] and list(remote._POOL) == ["winbox"]
+
+
+def test_env_prefers_labhand_names_and_falls_back_to_dualvm(monkeypatch):
+    monkeypatch.delenv("LABHAND_X", raising=False)
+    monkeypatch.delenv("DUALVM_X", raising=False)
+    assert hosts.env_path("LABHAND_X", "DUALVM_X", "d") == "d"
+    monkeypatch.setenv("DUALVM_X", "old")
+    assert hosts.env_path("LABHAND_X", "DUALVM_X", "d") == "old"
+    monkeypatch.setenv("LABHAND_X", "new")
+    assert hosts.env_path("LABHAND_X", "DUALVM_X", "d") == "new"
+
+
+def test_default_key_prefers_labhand_then_the_single_existing_key(tmp_path):
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    assert remote._default_key(str(keys)).endswith("labhand_ed25519")      # nothing there
+    (keys / "dualvm_ed25519").write_text("k")
+    (keys / "dualvm_ed25519.pub").write_text("p")
+    assert remote._default_key(str(keys)).endswith("dualvm_ed25519")        # pre-rename checkout
+    (keys / "other_rsa").write_text("k")
+    assert remote._default_key(str(keys)).endswith("labhand_ed25519")      # ambiguous: no guess
+    (keys / "labhand_ed25519").write_text("k")
+    assert remote._default_key(str(keys)).endswith("labhand_ed25519")
