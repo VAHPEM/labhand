@@ -27,7 +27,7 @@ without a virtualenv. Only the worker-facing MCP server needs the `mcp` package.
 | `report.py` | `REPORT.md` (near-done first, then what needs you) and a mermaid/HTML graph. |
 | `decider.py` | At a branch (`ask(kind="approach_choice")`), a separate model (Opus 5.5) ranks the options from the problem's ledger, evidence, the human's answers, the worker's brief and the session's observations (tool calls + outputs; `decider_transcript=full` adds the worker's prose). Its ranking orders the nodes; its reasons go into the ledger. Falls back to the worker's order without a key / over budget / on refusal or timeout. |
 | `classify.py` | A question the worker left as prose at a stop is read by Opus (`classifier_model`) with the problem's ledger and the session's observations: a choice is made on the spot, a request to run something is approved by your standing rule, only information you alone have comes to you; when the worker looks stuck it adds a step-back note. No key / over budget = keyword heuristic. |
-| `project.py` | `beacon setup-project DIR`: merges the hooks, an allow rule for the beacon MCP tools, the MCP server entry and the worker rules into a project (backups as `*.beacon-bak`; never installs the hooks twice across `settings.json` / `settings.local.json`). |
+| `project.py` | `beacon setup-project DIR`: merges the hooks, an allow rule for the beacon MCP tools, the MCP server entry and the worker rules into a project (backups as `*.beacon-bak`; never installs the hooks twice across `settings.json` / `settings.local.json`); `beacon teardown-project DIR` removes exactly that again. |
 | `vmstate.py` | `vm_check` tool: fingerprints a VM through labhand (processes, listening ports, samples/ digest without labhand's `_*` files), keeps a baseline in the ledger and attaches each check as evidence, so a dead end shows whether the VM was clean. |
 | `evalkit.py` | `beacon eval`: runs a suite under `baseline` / `gate` / `gate_lh` / `gate_lh_alt` (lighthouse on another Claude model), isolated copies, web denied, success decided by the task's verify command; `results.jsonl` (resumable) + `summary.md`. |
 | `demo.py` | `beacon demo`: a toy practice run (three puzzles, `check.py`, `TESTING.md`) and `--auto`, a live smoke test of the whole cycle with the real Claude Code. |
@@ -86,6 +86,46 @@ nothing to accept. Two ways out, both only for you:
 
 Both are recorded as the human (actor `human` in the hash chain). The terminal forms need a TTY and
 the PreToolUse guard refuses them from the worker's Bash; no MCP tool reaches them.
+
+### Removing beacon from a project
+
+`beacon teardown-project DIR` is the inverse of `setup-project`. It removes:
+
+- the worker-rules block between its markers in `CLAUDE.md`;
+- beacon's hooks, its `mcp__beacon` allow rule and its deny rules in `.claude/settings.json` and
+  `.claude/settings.local.json`;
+- the beacon server in `.mcp.json`;
+- `.claude/beacon`.
+
+Everything else stays. A file left with nothing in it is removed. Changed or removed files are
+backed up as `*.beacon-bak`; a backup that already exists, such as the pre-setup copy
+`setup-project` made, is kept. An `mcp__labhand` allow rule is kept and reported: `setup-project
+--allow-labhand` adds it, but the project may have had it before. `--dry-run` shows what would
+change. The real run needs a terminal and is refused from the worker's Bash.
+
+### Running beacon on a repo that contains beacon
+
+When the worker's project is this repo (or any checkout with a `beacon/` package), the worker edits
+the very code that supervises it. Worse, Python imports that code: Claude Code runs the hooks with the
+project as the working directory, and `python -m beacon.hooks` puts the working directory first on
+`sys.path`. So the hooks would load the project's `beacon/` instead of the copy you installed. Run
+the supervisor from a frozen copy, with `python -P` (Python ≥ 3.11), which leaves the working
+directory off `sys.path`. This is how the labhand run was supervised:
+
+```bash
+rsync -a --exclude .git --exclude __pycache__ ~/labhand/ ~/beacon-frozen/     # a snapshot, not a checkout
+printf '#!/bin/sh\nexec ~/venvs/lab/bin/python -P "$@"\n' > ~/beacon-frozen/py   # a python with `mcp`
+chmod +x ~/beacon-frozen/py
+PYTHONPATH=~/beacon-frozen ~/beacon-frozen/py -m beacon setup-project ~/labhand \
+    --python ~/beacon-frozen/py --mcp-python ~/beacon-frozen/py
+PYTHONPATH=~/beacon-frozen ~/beacon-frozen/py -m beacon init ~/beacon-runs/labhand --checklist ck.md
+cd ~/labhand && .claude/beacon claude --run ~/beacon-runs/labhand
+```
+
+Run `setup-project` from the frozen copy, so the hook commands, the MCP server and `.claude/beacon`
+all point at `~/beacon-frozen` through `py`. Refresh the copy only between runs. Afterwards,
+`PYTHONPATH=~/beacon-frozen ~/beacon-frozen/py -m beacon teardown-project ~/labhand` unwires the
+repo.
 
 ## Watching it — in the Claude Code chat or in a terminal
 

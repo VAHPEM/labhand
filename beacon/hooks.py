@@ -40,7 +40,7 @@ OWN_TOOL_PREFIX = "mcp__beacon__"
 # own questions, or set notify_cmd (a shell command the hooks run) through Bash.
 HUMAN_CLI = re.compile(r"(?:-m\s+beacon(?:\.cli)?|\bbeacon(?:\.cli)?(?:\s|$)|/beacon\s)\s*"
                        r"(?:--run\s+\S+\s+)?(answer|verify|set-verify|reopen|config|lighthouse|init|"
-                       r"setup-project)\b")
+                       r"setup-project|teardown-project)\b")
 WEB_TOOLS = ("WebSearch", "WebFetch")
 PROTECTED_NAMES = ("settings.json", "settings.local.json")
 
@@ -253,7 +253,7 @@ def guard(tool, tool_input, roots, cfg):
         cmd = str(ti.get("command", ""))
         if HUMAN_CLI.search(cmd):
             return ("That beacon command is for the human (answer, verify, set-verify, reopen, config, lighthouse, "
-                    "init, setup-project). Use the beacon tools; ask() if you need the human.")
+                    "init, setup-project, teardown-project). Use the beacon tools; ask() if you need the human.")
         if NESTED_CLAUDE.search(cmd):
             return ("Starting another Claude Code session is disabled during a beacon run; use the Agent tool "
                     "for a subagent.")

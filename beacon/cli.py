@@ -13,6 +13,7 @@
     python3 -m beacon lighthouse [--dry-run]                 call (or preview) the reviewer
     python3 -m beacon watch --cwd PROJECT                    run the worker unattended (watchdog)
     python3 -m beacon setup-project DIR                      wire a worker project (hooks, MCP, rules)
+    python3 -m beacon teardown-project DIR                   undo setup-project, keeping everything else
     python3 -m beacon log [-n 10] [-f]                       each stop: what Claude said + what beacon replied
     python3 -m beacon transcript [-n 40] [-f]                Claude Code's full session log, readable
     python3 -m beacon graph                                  the visual graph in the browser (live)
@@ -315,6 +316,20 @@ def cmd_setup_project(args):
     return 0
 
 
+def cmd_teardown_project(args):
+    from .project import teardown_project
+    if not args.dry_run:
+        _require_terminal("teardown-project")     # it removes the supervision itself
+    changes = teardown_project(args.project, dry_run=args.dry_run)
+    print(("Would change:" if args.dry_run else "Changed:") if changes else "No beacon wiring found; nothing to change.")
+    for c in changes:
+        print("  " + c)
+    if changes and not args.dry_run:
+        print("Backups of changed or removed files: <file>.beacon-bak (an existing backup, e.g. from "
+              "setup-project, is kept)")
+    return 0
+
+
 def cmd_log(args):
     from .logview import follow_log, stop_log
     L = _open(args)
@@ -515,6 +530,10 @@ def build_parser():
                    help="set respondToBashCommands=false: `! .claude/beacon log` output gets no model reply")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_setup_project)
+    p = sub.add_parser("teardown-project", help="undo setup-project: remove beacon's wiring, keep the rest")
+    p.add_argument("project")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_teardown_project)
     p = with_run(sub.add_parser("log", help="each stop: what Claude Code said and what beacon replied"))
     p.add_argument("-n", type=int, default=10)
     p.add_argument("--width", type=int, default=600)
