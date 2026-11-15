@@ -216,3 +216,22 @@ def test_progress_ends_a_dry_streak(make_run):
     assert stop(L, lighthouse=lh).action == "block"          # progress: streak reset, no call
     assert L.gate_state()["lighthouse_dry"] == 0
     assert stop(L, lighthouse=lh).action == "block"          # stuck again: a fresh dry round 1
+
+
+def test_an_orchestrator_lead_resets_the_stall_like_a_lighthouse_round(make_run):
+    """No model budget (the default since 2026-11-15): a stall ends the run as lighthouse_exhausted and the
+    orchestrator plays the lighthouse. Its lead must give the worker a full set of rounds, not end the run
+    again at the very next stop (found in review, 2026-11-15)."""
+    L = make_run(k_stall=2, k_idle=99, max_lighthouse_calls=0)
+    a = L.add_node("P1", "a running approach", kind="approach")
+    L.start(a)
+    for i in range(2):
+        L.attach_evidence(a, f"output {i}", content=f"out {i}")
+        d = stop(L)
+    assert d.action == "allow" and d.why == "lighthouse_exhausted"
+    L.add_node("P1", "trace the decoder with Frida instead", kind="approach", actor="orchestrator")
+    L.attach_evidence(a, "output 2", content="out 2")
+    d = stop(L)
+    assert d.action == "block" and L.gate_state()["stall"] == 0
+    L.attach_evidence(a, "output 3", content="out 3")
+    assert stop(L).action == "block"                    # still within the fresh rounds

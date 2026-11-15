@@ -400,6 +400,14 @@ def on_stop(L, inp, lighthouse=None, now=None, classifier=None, rotate=False, fo
     g["idle"] = 0 if (new_ev or waiting or activity or bg) else g["idle"] + 1
     g["last_progress"], g["last_evidence"] = prog, ev
     g["last_evidence_seq"] = L.last_seq()
+    # The orchestrator acting as the lighthouse (ccbridge, no model calls): a lead it added, a dead end it
+    # reopened or a node it picked since the last stop counts like a lighthouse round that added ideas, so the
+    # worker gets a full set of rounds on it instead of the next stop ending the run as stalled again.
+    orch = [e for e in L.events(since_seq=int(g.get("orch_seq", 0)))
+            if e["actor"] == "orchestrator" and e["type"] in ("add_node", "reopen", "pick")]
+    if orch:
+        g["orch_seq"] = max(int(e["seq"]) for e in orch)
+        g["stall"], g["idle"], g["lighthouse_dry"] = 0, 0, 0
 
     answered = [q for q in L.questions("answered") if not q["delivered"]]
     last_flag = int(g.get("last_flag_seq", 0))
