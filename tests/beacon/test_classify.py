@@ -4,7 +4,7 @@ import os
 from beacon.classify import classify, heuristic, last_question
 from beacon.gate import activity_line, on_stop
 
-CFG = {"classifier_min_confidence": 0.6}          # classifier_model defaults to Opus
+CFG = {"classifier_min_confidence": 0.6, "max_classifier_calls": 100}   # beacon's default budget is 0          # classifier_model defaults to Opus
 
 
 def model(kind, conf=0.9, question="q?", calls=None, **extra):

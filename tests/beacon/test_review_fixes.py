@@ -134,7 +134,7 @@ def _capture(reply):
 def test_opus_calls_carry_effort_schema_and_room_to_think(make_run):
     t = _capture({"kind": "need_info", "question": "which file?", "confidence": 0.9, "choice": "", "why": "",
                   "real_sample": False, "note": ""})
-    classify("Which file holds the config?", {}, transport=t, key="k")
+    classify("Which file holds the config?", {"max_classifier_calls": 100}, transport=t, key="k")
     body = t.sent[0]
     assert body["model"] == "claude-opus-5-5" and body["max_tokens"] >= 4000
     assert body["output_config"]["effort"] == "medium" and body["output_config"]["format"]["type"] == "json_schema"

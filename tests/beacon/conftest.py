@@ -17,6 +17,26 @@ def _no_real_api(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+# The production default is no model calls at all (Ve, 2026-11-15: the orchestrator is beacon's lighthouse,
+# decider and classifier). The model paths are still tested against mock transports, so the suite gives them
+# the budgets they had; test_no_model_calls.py (marker real_defaults) checks the real defaults.
+MODEL_BUDGETS_FOR_TESTS = {"max_lighthouse_calls": 20, "max_classifier_calls": 100, "max_decider_calls": 60,
+                           "max_followup_calls": 100}
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "real_defaults: run with beacon's real DEFAULT_CONFIG (no model budgets)")
+
+
+@pytest.fixture(autouse=True)
+def _model_budgets_for_mocked_model_paths(request, monkeypatch):
+    if request.node.get_closest_marker("real_defaults"):
+        return
+    from beacon import ledger
+    for key, value in MODEL_BUDGETS_FOR_TESTS.items():
+        monkeypatch.setitem(ledger.DEFAULT_CONFIG, key, value)
+
+
 @pytest.fixture
 def make_run(tmp_path):
     """make_run(problems=..., **config) -> Ledger in a fresh run directory."""

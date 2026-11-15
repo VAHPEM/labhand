@@ -346,6 +346,12 @@ python3 -m beacon watch --run ~/beacon-runs/fo13 --cwd ~/ctf/fo13          # run
   Bash commands naming the ledger, `.claude/settings*`, `.mcp.json`); the state digest
   catches the rest. On a failed integrity check the gate writes nothing (a new event
   would re-seal the tampered state) and stops with a loud report.
+- **No model calls by default (since 2026-11-15).** `max_lighthouse_calls`, `max_decider_calls`,
+  `max_classifier_calls` and `max_followup_calls` default to 0: a stall stops the run for the human (or the
+  orchestrator acting for them, ccbridge), a branch keeps the worker's order, a prose question goes through
+  the keyword heuristic, leftovers are pushed back to the worker. To use the models below, raise the budgets
+  for a run (`beacon init RUN ... --set max_lighthouse_calls=20`, or `beacon config`) and provide
+  `BEACON_API_KEY`. ccbridge also strips every API key from the runs it starts.
 - **Which model, when.** Opus 5.5 everywhere a model judges: (a) `classifier_model`, a question left
   as prose at a stop (at most `max_classifier_calls`, 100, per run; "shall I continue?" is answered without
   a call); (b) the lighthouse, when the run stalls (`max_lighthouse_calls`, 20); (c) the decider, at every

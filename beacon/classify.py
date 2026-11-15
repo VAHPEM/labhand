@@ -102,7 +102,7 @@ def check_real_sample(text, cfg, transport=None, key=None, context="", calls_use
     if not (_RUN_VERB.search(t) and _HINT.search(t)):
         return False, "keywords", ""
     key = key or load_key()
-    if (not key and transport is None) or calls_used >= int(cfg.get("max_classifier_calls", 100)):
+    if (not key and transport is None) or calls_used >= int(cfg.get("max_classifier_calls", 0)):
         return False, "keywords", "no model to check it"
     user = "<request>\n" + t[-4000:].replace("<", "&lt;") + "\n</request>" + ("\n\n" + context if context else "")
     try:
@@ -144,7 +144,7 @@ def classify(text, cfg, transport=None, key=None, context=None, calls_used=0):
     if _RHETORICAL.search(q) and not (_PERMISSION.search(q) or _INFO.search(q) or _CHOICE.search(q)):
         return _result("rhetorical", q, "heuristic")          # free: no model call for "shall I continue?"
     key = key or load_key()
-    if (not key and transport is None) or calls_used >= int(cfg.get("max_classifier_calls", 100)):
+    if (not key and transport is None) or calls_used >= int(cfg.get("max_classifier_calls", 0)):
         return _heuristic_result(text)
     ctx = ""
     try:

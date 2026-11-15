@@ -86,7 +86,8 @@ def test_extract_uses_schema_effort_and_filters_items():
              "existing": "", "question": ""}]}
         return {"stop_reason": "end_turn", "content": [{"type": "text", "text": json.dumps(reply)}]}
 
-    r = followups.extract(LEFTOVER_MSG, {"followup_effort": "medium"}, context="<ledger>P1</ledger>",
+    r = followups.extract(LEFTOVER_MSG, {"followup_effort": "medium", "max_followup_calls": 100},
+                          context="<ledger>P1</ledger>",
                           transport=transport, key="k")
     assert r["source"] == "model" and r["attempted"]
     assert [i["title"] for i in r["items"]] == ["Run the test suite on the Windows VM"]
@@ -107,7 +108,7 @@ def test_extract_without_key_or_budget_makes_no_call():
 def test_extract_survives_an_api_error():
     def transport(body, key, timeout):
         raise RuntimeError("HTTP 400: bad request")
-    r = followups.extract(LEFTOVER_MSG, {}, transport=transport, key="k")
+    r = followups.extract(LEFTOVER_MSG, {"max_followup_calls": 100}, transport=transport, key="k")
     assert r["source"] == "unavailable" and r["attempted"] and "HTTP 400" in r["error"]
 
 

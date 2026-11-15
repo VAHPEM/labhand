@@ -110,7 +110,7 @@ def extract(text, cfg, context="", transport=None, key=None, calls_used=0):
     key = key or load_key()
     if not key and transport is None:
         return {"items": [], "source": "unavailable", "error": "no API key", "attempted": False}
-    if calls_used >= int(cfg.get("max_followup_calls", 100)):
+    if calls_used >= int(cfg.get("max_followup_calls", 0)):
         return {"items": [], "source": "unavailable", "error": "follow-up call budget spent", "attempted": False}
     try:
         ctx = context() if callable(context) else (context or "")

@@ -204,7 +204,7 @@ def decide(L, parent_id, question, option_ids, brief="", transport=None, key=Non
         return dict(base, status="unavailable", detail="no BEACON_API_KEY or BEACON_API_KEY_FILE in the beacon MCP "
                                                        "server's environment (ANTHROPIC_API_KEY is missing too: a "
                                                        "subscription login, or Claude Code scrubbed it)")
-    if decisions_made(L) >= int(cfg.get("max_decider_calls", 60)):
+    if decisions_made(L) >= int(cfg.get("max_decider_calls", 0)):
         return dict(base, status="budget", detail=f"decider budget of {cfg.get('max_decider_calls')} calls spent")
     try:
         obj, resp = call_json(cfg["decider_model"], system_prompt(cfg), build_prompt(L, parent_id, question, option_ids, brief, cfg),

@@ -80,7 +80,7 @@ DEFAULT_CONFIG = {
     "hard_forced": 40,           # never exceeded, never auto-extended
     "k_stall": 4,                # stops without a conclusion -> lighthouse
     "k_idle": 2,                 # stops without any new evidence -> lighthouse
-    "max_lighthouse_calls": 20,
+    "max_lighthouse_calls": 0,  # no model calls by default (Ve, 2026-11-15); was 20.
     "lighthouse_dry_max": 2,     # consecutive lighthouse rounds that add nothing
     "near_done_extension": 0.2,  # one-time soft-budget extension
     "near_done_claims_max": 3,   # claims without new evidence -> audit
@@ -105,7 +105,7 @@ DEFAULT_CONFIG = {
     "classifier_model": "claude-opus-5-5",   # reads a question left as prose at a stop; decides choices
     "classifier_max_tokens": 8000,
     "classifier_effort": "medium",
-    "max_classifier_calls": 100,
+    "max_classifier_calls": 0,  # no model calls by default (Ve, 2026-11-15); was 100.
     "classifier_min_confidence": 0.6,
     "classifier_timeout": 90,
     # A need_permission request that runs a file it does not vouch for is checked for a real malware sample
@@ -119,7 +119,7 @@ DEFAULT_CONFIG = {
     "decider_max_tokens": 16000,
     "decider_effort": "high",
     "decider_timeout": 100,      # under Claude Code's 2-minute mark, after which a tool call moves to the background
-    "max_decider_calls": 60,
+    "max_decider_calls": 0,  # no model calls by default (Ve, 2026-11-15); was 60.
     "decider_transcript": "observations",   # observations | full | off: how much of the session it reads
     "decider_transcript_chars": 80000,
     "permission_policy": "approve",  # approve: the worker's requests to run things are granted (standing rule); ask
@@ -133,7 +133,7 @@ DEFAULT_CONFIG = {
     "followup_max_tokens": 12000,
     "followup_effort": "medium",
     "followup_timeout": 90,
-    "max_followup_calls": 100,    # at most one per stop, each distinct message once (12 ran out in a 25-stop run)
+    "max_followup_calls": 0,  # no model calls by default (Ve, 2026-11-15); was 100.    # at most one per stop, each distinct message once (12 ran out in a 25-stop run)
     "followup_max_items": 8,     # per stop
     "followup_max_total": 40,    # per run: a worker that finds new gaps forever is stopped here
     "followup_autoverify": True,  # a follow-up problem closes once every item is closed with evidence

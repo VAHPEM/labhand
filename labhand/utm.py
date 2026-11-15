@@ -57,12 +57,12 @@ def utmctl_path():
     return None
 
 
-def _utmctl(args, timeout=60):
-    """(rc, combined output) of `utmctl <args>`; rc None = could not run / timed out."""
-    exe = utmctl_path()
-    if exe is None:
-        return None, ("utmctl not found (UTM.app not installed, or set LABHAND_UTMCTL); "
-                      f"labhand runs it locally on the UTM host, this is {platform.system()}")
+AUTOMATION_DENIED = ("macOS refused this process Automation access to UTM (OSStatus -1743), so utmctl sees no "
+                     "VM at all. Allow it in System Settings > Privacy & Security > Automation (the app that runs "
+                     "labhand, e.g. Terminal or Claude, > UTM), or run labhand from Terminal.app. utmctl said: ")
+
+
+def _run_utmctl(exe, args, timeout):
     try:
         p = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -70,6 +70,25 @@ def _utmctl(args, timeout=60):
     except OSError as e:
         return None, f"utmctl could not run: {e}"
     return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+
+
+def _utmctl(args, timeout=60):
+    """(rc, combined output) of `utmctl <args>`; rc None = could not run / timed out."""
+    exe = utmctl_path()
+    if exe is None:
+        return None, ("utmctl not found (UTM.app not installed, or set LABHAND_UTMCTL); "
+                      f"labhand runs it locally on the UTM host, this is {platform.system()}")
+    rc, out = _run_utmctl(exe, args, timeout)
+    # Measured 2026-11-15 from a process without Automation permission (Desktop Commander under the Claude
+    # app): `utmctl status <vm>` says only "Virtual machine not found"; `utmctl list` shows the cause,
+    # "OSStatus error -1743", and an empty list. Name the cause instead of a missing VM.
+    if rc is not None and "-1743" not in out and "not found" in out.lower() and args[:1] != ["list"]:
+        _, listed = _run_utmctl(exe, ["list"], 30)
+        if listed and "-1743" in listed:
+            return (rc or 1), AUTOMATION_DENIED + out
+    if rc is not None and "-1743" in out:
+        return (rc or 1), AUTOMATION_DENIED + out
+    return rc, out
 
 
 def _vm(host, tool, vm=None):

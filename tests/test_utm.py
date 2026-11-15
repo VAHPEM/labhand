@@ -232,3 +232,29 @@ def test_a_stop_forgets_the_session(lab):
     assert utm.vm_start("kali", disposable=True).ok
     assert utm.vm_stop("kali", how="force").ok
     assert utm._sessions() == {}
+
+
+def test_automation_denial_is_named_not_reported_as_a_missing_vm(tmp_path, monkeypatch):
+    """Measured 2026-11-15: without Automation permission utmctl status says only "Virtual machine not
+    found"; utmctl list shows OSStatus -1743. labhand now says which it is and how to allow it."""
+    fake = tmp_path / "utmctl"
+    fake.write_text('#!/bin/sh\ncase "$1" in\n'
+                    '  list) echo "Error from event: The operation could not be completed. (OSStatus error -1743)."; '
+                    'echo "UUID Status Name"; exit 0;;\n'
+                    '  *) echo "Error: Virtual machine not found."; exit 1;;\nesac\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(utm, "utmctl_path", lambda: str(fake))
+    rc, out = utm._utmctl(["status", "Kali Linux"])
+    assert rc == 1 and "Automation" in out and "-1743" in out and "Virtual machine not found" in out
+    rc, out = utm._utmctl(["list"])
+    assert rc == 1 and out.startswith(utm.AUTOMATION_DENIED)
+
+
+def test_a_really_missing_vm_is_still_reported_as_missing(tmp_path, monkeypatch):
+    fake = tmp_path / "utmctl"
+    fake.write_text('#!/bin/sh\ncase "$1" in\n  list) echo "UUID Status Name"; exit 0;;\n'
+                    '  *) echo "Error: Virtual machine not found."; exit 1;;\nesac\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(utm, "utmctl_path", lambda: str(fake))
+    rc, out = utm._utmctl(["status", "Nope"])
+    assert rc == 1 and out == "Error: Virtual machine not found."
