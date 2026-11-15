@@ -124,8 +124,8 @@ def test_hook_commands_survive_git_bash_on_windows(monkeypatch):
     assert shellrun.posix_path(r"C:\x\y") == (r"C:\x\y" if os.name != "nt" else "C:/x/y")
     monkeypatch.setattr(shellrun.os, "name", "nt")
     cmd = hook_command(r"C:\Users\ve\AppData\Local\Programs\Python\Python314\python.exe", "stop",
-                       repo=r"C:\Users\ve\dual-vm-ai-agent")
-    assert "\\" not in cmd and '"C:/Users/ve/dual-vm-ai-agent"' in cmd and cmd.endswith("-m beacon.hooks stop")
+                       repo=r"C:\Users\ve\labhand")
+    assert "\\" not in cmd and '"C:/Users/ve/labhand"' in cmd and cmd.endswith("-m beacon.hooks stop")
 
 
 def test_shellrun_runs_posix_shell_and_decodes_utf8(tmp_path):

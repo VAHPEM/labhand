@@ -43,8 +43,6 @@ Lab hosts reachable over SSH with one key. Point the package at your `.env` and 
 | `LABHAND_ENV` | path to the `.env` holding the host/user vars | `<pkg>/../.env` |
 | `LABHAND_SSH_KEY` | path to the private SSH key for every lab host | `<pkg>/../.ssh_keys/labhand_ed25519` if present, else the single key in `.ssh_keys/` |
 
-The pre-rename names `DUALVM_ENV` / `DUALVM_SSH_KEY` are read when the `LABHAND_*` one is unset.
-
 Hosts are a named inventory in `.env` (see [`.env.example`](.env.example)):
 
 ```bash
@@ -185,13 +183,6 @@ python skills/sync.py                          # -> .claude/skills/ of this chec
 python skills/sync.py --dest ~/.claude/skills  # user-wide, or any other skill dir
 python skills/sync.py --check                  # drift report, exit 1 if out of date
 ```
-
-## Renamed from `dualvm`
-
-The package was called `dualvm` until 2026-11. The old name still works: `import dualvm`
-(and `dualvm.shell`, ...) gives the very same `labhand` modules with one
-`DeprecationWarning`, `python -m dualvm.mcp_server` and the `dualvm-mcp` script start the
-same server, and `DUALVM_ENV` / `DUALVM_SSH_KEY` are honoured as fallbacks.
 
 ## License
 

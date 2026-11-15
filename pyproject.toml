@@ -15,17 +15,15 @@ mcp = ["mcp>=1.7,<3"]
 test = ["pytest"]
 
 [project.urls]
-Repository = "https://github.com/VAHPEM/dual-vm-ai-agent"
+Repository = "https://github.com/VAHPEM/labhand"
 
 [project.scripts]
 labhand-mcp = "labhand.mcp_server:main"
-dualvm-mcp = "labhand.mcp_server:main"      # pre-rename name, kept working
 beacon = "beacon.cli:main"
 beacon-mcp = "beacon.mcp_server:main"
 
 [tool.setuptools]
-# dualvm/ is the deprecated alias of labhand/ (see dualvm/__init__.py)
-packages = ["labhand", "dualvm", "beacon"]
+packages = ["labhand", "beacon"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

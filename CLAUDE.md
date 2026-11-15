@@ -9,8 +9,7 @@
 
 **The Muscle.** A deterministic, `$0` Python library (no model calls) that lets an AI
 **operate** the machines of a lab over SSH — today a **Kali Linux** VM and a **Windows** VM,
-more hosts later (see the host inventory below). The checkout is called `labhand/`
-here; the folder and the GitHub repo keep their old name `dual-vm-ai-agent`.
+more hosts later (see the host inventory below).
 Every function runs something on a VM and returns the **raw** output as a plain
 `VMResult`. It **never interprets** results and has no concept of "flag", "challenge"
 or "task". The deciding Brain lives elsewhere — any agent that imports this package.
@@ -18,8 +17,7 @@ or "task". The deciding Brain lives elsewhere — any agent that imports this pa
 ## Configure (once)
 
 `labhand` reads, by default, a `.env` and `.ssh_keys/` **next to the package**
-(repo root). Override with env vars `LABHAND_ENV` / `LABHAND_SSH_KEY` (the pre-rename
-`DUALVM_ENV` / `DUALVM_SSH_KEY` still work as a fallback).
+(repo root). Override with env vars `LABHAND_ENV` / `LABHAND_SSH_KEY`.
 
 - **Hosts are a named inventory** (`labhand/hosts.py`, example in `.env.example`):
   `LABHAND_HOSTS=kali,windows` and per host `<NAME>_HOST`, `<NAME>_USER`, `<NAME>_OS`
@@ -175,11 +173,6 @@ The server registers as `labhand`. See `labhand/mcp_server.py`.
 `labhand/`: `hosts.py` (the host inventory), `remote.py` (SSH/SFTP pool), `shell.py` (run/read), `windows.py`,
 `linux.py`, `jobs.py`, `images.py`, `safety.py`, `_result.py` (`VMResult`,
 `set_matcher`), `config.py`, `mcp_server.py`.
-
-`dualvm/`: the deprecated pre-rename name, kept as a thin alias — `import dualvm.X` is
-the same module object as `labhand.X` (one DeprecationWarning), and `python -m
-dualvm.mcp_server` / the `dualvm-mcp` script still start the server. `research/` and
-existing MCP configs rely on it; do not add code there.
 
 `skills/`: the agent skills, one `skills/<name>/SKILL.md` each — the **single source**,
 hand-edited markdown (`binary-analysis`: the analysis discipline R1-R10 and technique

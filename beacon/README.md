@@ -37,7 +37,7 @@ without a virtualenv. Only the worker-facing MCP server needs the `mcp` package.
 ## Quick start
 
 ```bash
-cd ~/dual-vm-ai-agent
+cd ~/labhand
 cat > /tmp/fo13.md <<'EOF'
 # Flare-On 13 practice
 - [ ] Challenge 5: recover the flag
