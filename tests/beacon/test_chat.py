@@ -106,7 +106,7 @@ def test_plain_reply_answers_only_when_claude_waits_and_one_is_open(make_run):
     L = make_run()
     L.ask("need_info", "Which port to use?")
     r = chat.handle(L, "port 8080", waiting_for_human=False)
-    assert r["block"] is False and "start it with `#N`" in r["show"] and "Which port to use?" in r["note"]
+    assert r["block"] is False and "Only `#1 <answer>` closes it" in r["show"] and "Which port to use?" in r["note"]
     assert L.questions("open")
     r = chat.handle(L, "port 8080", waiting_for_human=True)
     assert "Recorded as the answer to question" in r["show"] and "write `#N" in r["show"]

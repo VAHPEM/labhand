@@ -112,7 +112,7 @@ Type to beacon in the same chat box (the UserPromptSubmit hook reads it before C
 | `beacon: questions` / `beacon: report` / `beacon: help` | open questions / the report / the list |
 | `beacon: decisions` | the decider's latest branch decisions: order, why, first step, when to switch |
 | **Decide** — recorded as yours (actor `human` in the hash chain), then passed on to Claude with a note, so it carries on | |
-| `beacon: answer 3 use the arm64 image`, or `#3 use the arm64 image` | answer question 3 (a plain reply also counts when Claude stopped to wait for you and exactly one question is open; beacon says so) |
+| `beacon: answer 3 use the arm64 image`, or `#3 use the arm64 image` | answer question 3 (a plain reply also counts when Claude stopped to wait for you and exactly one question is open; beacon says so). With several open, only `#N <answer>` closes one: a plain reply reaches Claude but closes nothing, and beacon lists which are still open |
 | `beacon: verify P1` / `beacon: verify P1 reject wrong format` | accept / reject a candidate; an unclear word is refused, never read as "accept" |
 | `beacon: verify P1 force <why>` | declare P1 done past a wrong verify command (see below); the reason is required |
 | `beacon: add P1 <idea>` / `beacon: add P1.S1 approach <idea>` | your own hypothesis / approach, high priority, marked "● you" |

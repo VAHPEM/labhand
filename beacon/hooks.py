@@ -131,8 +131,8 @@ def stop(run, inp):
                 msg += (f"\n{p['id']} proposed by Claude: {p['title'][:160]}  -> `beacon: accept {p['id']}` "
                         f"or `beacon: reject {p['id']} <why>`")
             if qs:
-                msg += ("\n" + _questions(L)[:1200] + "\nReply with `#N <answer>`"
-                        + (" (or just reply: there is one question)" if len(qs) == 1 else ""))
+                from .chat import how_to_answer
+                msg += "\n" + _questions(L)[:1200] + "\n" + how_to_answer(qs, plain_ok=d.why == "awaiting_human")
             msg += "\n(`beacon: help` lists the chat commands.)"
         elif d.report:
             msg += "\n" + d.report[:400]

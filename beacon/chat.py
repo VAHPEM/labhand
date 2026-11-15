@@ -73,6 +73,19 @@ def _questions(L):
     return "\n".join(out)
 
 
+def how_to_answer(open_qs, plain_ok):
+    """How the human closes the open questions, listing every one still open. A plain reply is recorded only
+    when exactly one question is open and Claude stopped to wait for it (plain_ok); measured 2026-11-15: with
+    #2 and #3 open a plain reply was not recorded, Claude acted on it, and #3 stayed under "Waiting on you"."""
+    ids = ", ".join(f"#{q['id']}" for q in open_qs)
+    if len(open_qs) == 1 and plain_ok:
+        return f"Still open: {ids}. Reply with `{ids} <answer>` (or just reply: it is the only question)."
+    if len(open_qs) == 1:
+        return f"Still open: {ids}. Only `{ids} <answer>` closes it; a plain reply goes to Claude but closes nothing."
+    return (f"Still open: {ids}. With several questions open, only `#N <answer>` closes one (one message per "
+            "question); a plain reply goes to Claude but closes none of them.")
+
+
 def _show(L, nid):
     n = L.node(nid)
     lines = [f"{n['id']}  [{n['status']}]  {n['kind']}, added by {n['source']}", n["title"]]
@@ -328,6 +341,9 @@ def handle(L, prompt, waiting_for_human=False, opener=None):
         return {"block": False, "note": note, "changed": True,
                 "show": f"beacon ▸ {show} (Claude was waiting on it; write `#N …` to be explicit.)"}
     ids = ", ".join(f"#{q['id']}" for q in open_qs)
-    return {"block": False, "show": f"beacon ▸ open question(s) {ids}; to record a reply as the answer, start it "
-                                     f"with `#N` (`beacon: questions` lists them).",
-            "note": "Open questions to the human (unanswered in the ledger):\n" + _questions(L)}
+    return {"block": False,
+            "show": "beacon ▸ not recorded as an answer. " + how_to_answer(open_qs, plain_ok=False)
+                    + " (`beacon: questions` shows them.)",
+            "note": f"The human's message was NOT recorded as an answer; still open in the ledger: {ids}.\n"
+                    + _questions(L) + "\nIf the message answers one of them you may act on it, but only the human "
+                    "can close a question: ask them to confirm with `#N <answer>`. Do not treat it as answered."}

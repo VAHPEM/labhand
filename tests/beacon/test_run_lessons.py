@@ -272,3 +272,51 @@ def test_no_worker_tool_forces_or_changes_a_verify():
 def test_setup_project_denies_set_verify():
     from beacon.project import PROTECT_DENY
     assert "Bash(.claude/beacon set-verify *)" in PROTECT_DENY and "Bash(.claude/beacon verify *)" in PROTECT_DENY
+
+
+# ---------------------------------------------------------------- 4. plain replies with several questions open
+def test_a_plain_reply_with_two_open_questions_closes_nothing_and_says_so(make_run):
+    from beacon import chat
+    L = make_run()
+    L.ask("need_info", "Which port to use?")
+    L.ask("need_info", "Keep the old key file?")
+    r = chat.handle(L, "keep it, and use 8080", waiting_for_human=True)
+    assert [q["id"] for q in L.questions("open")] == [1, 2]            # the exact path: nothing recorded
+    assert "not recorded as an answer" in r["show"] and "Still open: #1, #2" in r["show"]
+    assert "only `#N <answer>` closes one" in r["show"]
+    assert "NOT recorded" in r["note"] and "only the human can close a question" in r["note"]
+    r = chat.handle(L, "#2 keep it", waiting_for_human=True)            # the explicit form still works
+    assert [q["id"] for q in L.questions("open")] == [1]
+
+
+def test_how_to_answer_lists_every_open_question():
+    from beacon.chat import how_to_answer
+    qs = [{"id": i} for i in (2, 3, 7)]
+    assert how_to_answer(qs, plain_ok=True).startswith("Still open: #2, #3, #7. With several questions open, "
+                                                       "only `#N <answer>` closes one")
+    one = [{"id": 3}]
+    assert "or just reply" in how_to_answer(one, plain_ok=True)
+    assert "or just reply" not in how_to_answer(one, plain_ok=False)
+    assert "Only `#3 <answer>` closes it" in how_to_answer(one, plain_ok=False)
+
+
+def test_the_stop_message_tells_the_human_how_to_close_questions(make_run):
+    """The stop hook's "Waiting on you" block, end to end through the real hook."""
+    from tests.beacon.test_chat import run_hook
+    L = make_run([{"title": "Only problem here"}])
+    tools.add_node("P1", "the approach", run=L.dir)
+    tools.ask("need_info", "Which port to use?", node_id="P1.S1", run=L.dir)
+    tools.ask("need_info", "Keep the old key file?", run=L.dir)
+    _, out, _ = run_hook("stop", {"session_id": "s", "last_assistant_message": "I need your answers to #1 and #2.",
+                                  "stop_hook_active": False}, run=L.dir)
+    assert "Still open: #1, #2" in out and "only `#N <answer>` closes one" in out
+
+
+def test_the_worker_cannot_answer_for_the_human(make_run):
+    L = make_run()
+    L.ask("need_info", "Which port to use?")
+    for actor in ("worker", "lighthouse", "gate", "verifier", "decider"):
+        with pytest.raises(LedgerError, match="only the human answers"):
+            L.answer(1, "8080", actor=actor)
+    assert not any("answer" in t.__name__ for t in tools.TOOLS)
+    assert L.questions("open")
