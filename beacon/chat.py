@@ -41,6 +41,7 @@ Look (answered by beacon here; nothing is sent to Claude, no tokens):
 Decide (recorded as yours, then passed on to Claude so it carries on):
   beacon: answer N <text>     answer question N            (short form:  #N <text>)
   beacon: verify P1           accept P1's candidate        beacon: verify P1 reject <why>   reject it
+  beacon: verify P1 force <why>  declare P1 done past a wrong verify command (in progress, blocked or pending)
   beacon: add P1 <idea>       add your own hypothesis/approach under a node
   beacon: reopen P1.A2 [note] reopen a closed node
   beacon: abandon P2 <why>    drop a problem or a node (you decide it is not worth it)
@@ -162,13 +163,21 @@ def act(L, words, rest):
             raise LedgerError("usage: beacon: verify P1   |   beacon: verify P1 reject <why>")
         pid = words[1]
         verdict = words[2].lower() if len(words) > 2 else "accept"
+        if verdict == "force":
+            if len(words) < 4:
+                raise LedgerError("usage: beacon: verify P1 force <why>   (the reason is required)")
+            why = rest.split(None, 3)[3]
+            r = L.force_verify(pid, why, actor="human")
+            return (f"{pid}: forced done (was {r['from']}): {why}." + dropped_note(L, r.get("dropped")),
+                    f"The human declared {pid} done without its verify command: {why}. Do not work on it.", False)
         if verdict in ("reject", "no", "wrong"):
             why = rest.split(None, 3)[3] if len(words) > 3 else "rejected by the human"
             L.verify(pid, False, why, actor="human")
             return (f"{pid}: candidate rejected ({why}).",
                     f"The human rejected the candidate for {pid}: {why}. It is open again.", False)
         if verdict not in ("accept", "ok", "yes", "correct"):   # never read an unclear word as "accept"
-            raise LedgerError("usage: beacon: verify P1   |   beacon: verify P1 reject <why>")
+            raise LedgerError("usage: beacon: verify P1   |   beacon: verify P1 reject <why>   |   "
+                              "beacon: verify P1 force <why>")
         r = L.verify(pid, True, "verified by the human in chat", actor="human") or {}
         return (f"{pid}: candidate accepted, problem done." + dropped_note(L, r.get("dropped")),
                 f"The human verified {pid}: it is done.", False)

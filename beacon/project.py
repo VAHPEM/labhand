@@ -27,8 +27,8 @@ HOOK_EVENTS = (("Stop", "stop", 300), ("SessionStart", "session-start", 30),
 # (Edit rules cover every built-in file-editing tool.)
 PROTECT_DENY = ("Edit(**/ledger.db*)", "Bash(sqlite3 *)", "Edit(**/.claude/settings.json)",
                 "Edit(**/.claude/settings.local.json)", "Edit(**/.mcp.json)", "Edit(**/.claude/beacon)") + tuple(
-    f"Bash(.claude/beacon {c} *)" for c in ("answer", "verify", "reopen", "config", "lighthouse", "init",
-                                            "setup-project"))
+    f"Bash(.claude/beacon {c} *)" for c in ("answer", "verify", "set-verify", "reopen", "config", "lighthouse",
+                                            "init", "setup-project"))
 WRAPPER = """#!/bin/sh
 # beacon, for `! .claude/beacon ...` in the Claude Code chat (and any terminal in this project).
 # Written by `beacon setup-project`. The commands that act as the human (answer, verify, ...) need a terminal.

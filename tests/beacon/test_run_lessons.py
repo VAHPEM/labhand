@@ -133,3 +133,142 @@ def test_a_timeout_reports_the_output_so_far(tmp_path):
     from beacon.ledger import run_verify
     ok, detail = run_verify('echo "reached step 2"; sleep 5', "c", str(tmp_path), timeout=1)
     assert not ok and detail.startswith("verify_cmd timed out after 1 s")
+
+
+# ---------------------------------------------------------------- 3. past a wrong verify command
+class _TTY:
+    def isatty(self):
+        return True
+
+
+@pytest.fixture
+def tty(monkeypatch):
+    import sys
+    monkeypatch.setattr(sys, "stdin", _TTY())
+
+
+@pytest.fixture
+def no_tty(monkeypatch):
+    import io
+    import sys
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+
+def _wrong_cmd_run(make_run):
+    L = make_run([{"title": "Drop the shim", "verify_cmd": "exit 1"}, {"title": "Second problem here"}])
+    tools.add_node("P1", "remove the alias package", run=L.dir)
+    tools.attach_evidence("P1.S1", "grep output", content="nothing left", run=L.dir)
+    assert "REJECTED" in tools.propose_done("P1", "done", [1], run=L.dir)
+    assert L.node("P1")["status"] == "in_progress"            # never stays in pending_verification
+    return L
+
+
+def test_force_verify_from_each_allowed_state_records_the_human(make_run):
+    L = _wrong_cmd_run(make_run)
+    q = tools.ask("need_info", "which branch?", node_id="P1.S1", run=L.dir)
+    r = L.force_verify("P1", "the verify command greps the wrong dir", actor="human")
+    assert r["from"] == "in_progress" and L.node("P1")["status"] == "done"
+    assert L.node("P1.S1")["status"] == "superseded" and "#" in q and r["dropped"]
+    ev = L.events(etype="verify_forced")[-1]
+    assert ev["actor"] == "human" and "greps the wrong dir" in ev["payload"]
+    assert L.verify_integrity()[0]
+    L.set_status("P2", "blocked", reason="waits on the lab VM", actor="worker")
+    assert L.force_verify("P2", "done by hand outside the run", actor="human")["from"] == "blocked"
+    L3 = make_run([{"title": "Human-checked one"}])
+    tools.add_node("P1", "the approach", run=L3.dir)
+    tools.start_node("P1.S1", run=L3.dir)
+    tools.attach_evidence("P1.S1", "the approach's own output", content="out of L3", run=L3.dir)
+    assert "pending human verification" in tools.propose_done("P1", "cand", [1], run=L3.dir)
+    assert L3.force_verify("P1", "checked it myself", actor="human")["from"] == "pending_verification"
+
+
+@pytest.mark.parametrize("actor", ["worker", "lighthouse", "gate", "verifier", "decider", "checklist"])
+def test_only_the_human_forces_or_changes_a_verify(make_run, actor):
+    L = _wrong_cmd_run(make_run)
+    with pytest.raises(LedgerError, match="only the human"):
+        L.force_verify("P1", "the worker says it is fine", actor=actor)
+    with pytest.raises(LedgerError, match="only the human"):
+        L.set_verify_cmd("P1", "true", actor=actor)
+    assert L.node("P1")["status"] == "in_progress" and L.node("P1")["verify_cmd"] == "exit 1"
+
+
+def test_force_verify_refusals(make_run):
+    L = make_run([{"title": "Drop the shim", "verify_cmd": "exit 1"}])
+    with pytest.raises(LedgerError, match="works from"):
+        L.force_verify("P1", "todo is not allowed", actor="human")       # todo: not in the allowed states
+    tools.add_node("P1", "remove the alias package", run=L.dir)
+    tools.start_node("P1.S1", run=L.dir)                               # the problem is in_progress now
+    for why in ("", "short", "       "):
+        with pytest.raises(LedgerError, match="reason"):
+            L.force_verify("P1", why, actor="human")
+    with pytest.raises(LedgerError, match="not a problem"):
+        L.force_verify("P1.S1", "a node is not a problem", actor="human")
+    L.force_verify("P1", "eight ch", actor="human")                       # exactly MIN_REASON
+    with pytest.raises(LedgerError, match="works from"):
+        L.force_verify("P1", "already done once", actor="human")
+
+
+def test_set_verify_replaces_the_command_and_it_is_used(make_run):
+    L = _wrong_cmd_run(make_run)
+    L.set_verify_cmd("P1", 'test "$BEACON_CANDIDATE" = done', actor="human")
+    ev = L.events(etype="set_verify")[-1]
+    assert ev["actor"] == "human" and L.verify_integrity()[0]
+    assert "VERIFIED" in tools.propose_done("P1", "done", [1], run=L.dir)
+    with pytest.raises(LedgerError, match="reopen it first"):
+        L.set_verify_cmd("P1", "true", actor="human")
+    with pytest.raises(LedgerError, match="empty"):
+        L.set_verify_cmd("P2", "   ", actor="human")
+
+
+def test_cli_force_and_set_verify(make_run, tty, capsys):
+    L = _wrong_cmd_run(make_run)
+    assert cli.main(["verify", "P1", "--force", "--run", L.dir]) == 2
+    assert "--note" in capsys.readouterr().err
+    assert cli.main(["verify", "P1", "--force", "--reject", "no", "--note", "a reason here", "--run", L.dir]) == 2
+    assert cli.main(["set-verify", "P2", "true", "--run", L.dir]) in (0, None)
+    assert Ledger.open(L.dir).node("P2")["verify_cmd"] == "true"
+    assert cli.main(["verify", "P1", "--force", "--note", "wrong verify command", "--run", L.dir]) in (0, None)
+    assert "forced done (was in_progress)" in capsys.readouterr().out
+    assert Ledger.open(L.dir).node("P1")["status"] == "done"
+
+
+@pytest.mark.parametrize("argv", [["verify", "P1", "--force", "--note", "a worker trying"],
+                                  ["set-verify", "P1", "true"]])
+def test_cli_force_and_set_verify_need_a_terminal(make_run, no_tty, capsys, argv):
+    L = _wrong_cmd_run(make_run)
+    assert cli.main(argv + ["--run", L.dir]) == 2
+    assert "must be run from a terminal" in capsys.readouterr().err
+    assert L.node("P1")["status"] == "in_progress" and L.node("P1")["verify_cmd"] == "exit 1"
+
+
+def test_chat_force(make_run):
+    from beacon import chat
+    L = _wrong_cmd_run(make_run)
+    r = chat.handle(L, "beacon: verify P1 force")
+    assert r["block"] and "reason is required" in r["show"]
+    r = chat.handle(L, "beacon: verify P1 force the check greps the wrong directory")
+    assert not r["block"] and "forced done" in r["show"] and "without its verify command" in r["note"]
+    assert L.node("P1")["status"] == "done"
+    assert L.events(etype="verify_forced")[-1]["actor"] == "human"
+
+
+@pytest.mark.parametrize("cmd", ["python3 -m beacon set-verify P1 true", "beacon set-verify P1 true",
+                                 ".claude/beacon --run /r set-verify P1 true",
+                                 "python3 -m beacon verify P1 --force --note x"])
+def test_worker_bash_cannot_reach_force_or_set_verify(make_run, cmd):
+    from beacon.hooks import guard
+    assert "for the human" in guard("Bash", {"command": cmd}, [make_run().dir], {})
+
+
+def test_no_worker_tool_forces_or_changes_a_verify():
+    import inspect
+    mcp_server = pytest.importorskip("beacon.mcp_server")
+    names = {t.__name__ for t in tools.TOOLS}
+    assert not any("force" in n or "set_verify" in n or n == "verify" for n in names)
+    src = inspect.getsource(tools) + inspect.getsource(mcp_server)
+    assert "force_verify" not in src and "set_verify_cmd" not in src
+
+
+def test_setup_project_denies_set_verify():
+    from beacon.project import PROTECT_DENY
+    assert "Bash(.claude/beacon set-verify *)" in PROTECT_DENY and "Bash(.claude/beacon verify *)" in PROTECT_DENY
