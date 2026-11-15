@@ -22,7 +22,7 @@ without a virtualenv. Only the worker-facing MCP server needs the `mcp` package.
 | `chat.py` | `beacon: …` commands typed in the Claude Code chat (`beacon: help` lists them); `#N <text>` answers question N. |
 | `board.py` | The visual graph: `<run>/graph.html`, self-contained (no CDN), statuses as colours + symbols, details per node, what waits on you, recent stops; rewritten by the hooks after each change once opened, and reloads itself while "live" is ticked. |
 | `logview.py` | `beacon log` (each stop: what Claude Code said + the exact reply beacon sent) and `beacon transcript` (Claude Code's own session log, readable), both with `--follow`. |
-| `tools.py`, `mcp_server.py` | The worker's write path: `ledger_view`, `add_node`, `start_node`, `attach_evidence`, `set_status`, `propose_done`, `claim_near_done`, `ask`, `mark_waiting`. |
+| `tools.py`, `mcp_server.py` | The worker's write path: `ledger_view`, `problem_note`, `add_node`, `start_node`, `attach_evidence`, `set_status`, `propose_done`, `claim_near_done`, `ask`, `mark_waiting`. |
 | `cli.py` | The human's side: `init`, `status`, `report`, `graph`, `check`, `answer`, `verify`, `reopen`, `config`, `hooks-config`, `lighthouse`, `log`, `transcript`, `claude`, `watch`, `doctor`. `answer`/`verify`/`reopen`/`config KEY=VAL`/`lighthouse` need a terminal (stdin a TTY). |
 | `report.py` | `REPORT.md` (near-done first, then what needs you) and a mermaid/HTML graph. |
 | `decider.py` | At a branch (`ask(kind="approach_choice")`), a separate model (Opus 5.5) ranks the options from the problem's ledger, evidence, the human's answers, the worker's brief and the session's observations (tool calls + outputs; `decider_transcript=full` adds the worker's prose). Its ranking orders the nodes; its reasons go into the ledger. Falls back to the worker's order without a key / over budget / on refusal or timeout. |
@@ -46,6 +46,8 @@ cat > /tmp/fo13.md <<'EOF'
 - [ ] Challenge 6: triage the crash in the parser
 EOF
 # verify: exit 0 = accepted; the candidate arrives in $BEACON_CANDIDATE (never on the command line)
+# note: the worker sees a note whole in ledger_view up to 4000 characters; a longer one is shown cut with
+# "(cut, N more chars)" and read in full with the problem_note tool (`beacon init` warns about it)
 python3 -m beacon init ~/beacon-runs/fo13 --checklist /tmp/fo13.md
 python3 -m beacon setup-project ~/ctf/fo13 --mcp-python ~/venvs/labhand/bin/python   # hooks, MCP, rules
 python3 -m beacon claude --run ~/beacon-runs/fo13   # interactive (= BEACON_RUN=… claude); `beacon watch` unattended

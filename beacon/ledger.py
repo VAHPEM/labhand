@@ -64,6 +64,11 @@ ACTORS = ("worker", "lighthouse", "human", "gate", "verifier", "checklist", "dec
 
 MIN_REASON = 8          # characters; a one-word reason is not a reason
 MAX_TEXT = 4000         # per free-text field
+# A checklist note is the human's instructions to the worker. Measured 2026-11-15: the tree showed only its first
+# 600 characters and the worker never saw half of P1's. The tree now shows NOTE_SHOW characters and says how much
+# is left; problem_note returns all of it. A note longer than NOTE_MAX is refused at init (never cut silently).
+NOTE_SHOW = 4000
+NOTE_MAX = 32000
 EXCERPT_HEAD, EXCERPT_TAIL = 1500, 500
 
 DEFAULT_CONFIG = {
@@ -169,6 +174,15 @@ def _excerpt(text):
     if len(text) <= EXCERPT_HEAD + EXCERPT_TAIL:
         return text
     return text[:EXCERPT_HEAD] + "\n…[snip]…\n" + text[-EXCERPT_TAIL:]
+
+
+def note_preview(note, node_id):
+    """A note on one line for the tree: whole up to NOTE_SHOW characters, else cut with how much is left."""
+    flat = (note or "").replace("\n", " | ")
+    if len(flat) <= NOTE_SHOW:
+        return flat
+    return (flat[:NOTE_SHOW] + f" … (cut, {len(flat) - NOTE_SHOW} more chars: problem_note(\"{node_id}\") "
+            "returns the whole note)")
 
 
 def _norm_title(title):
@@ -285,6 +299,9 @@ class Ledger:
         for i, p in enumerate(problems, 1):
             if not isinstance(p, dict) or len(str(p.get("title") or "").strip()) < 3:
                 raise LedgerError(f"problem #{i} needs a title")
+            if len(str(p.get("rationale") or "")) > NOTE_MAX:
+                raise LedgerError(f"problem #{i}'s note is {len(str(p['rationale']))} characters; the limit is "
+                                  f"{NOTE_MAX}. Shorten it or move the details to a file the note points to")
         cfg = dict(DEFAULT_CONFIG)
         cfg.update(config or {})
         if cfg.get("permission_mode") not in PERMISSION_MODES:
@@ -310,7 +327,7 @@ class Ledger:
                     "INSERT INTO nodes(id, kind, parent, title, rationale, status, priority,"
                     " source, reason, verify_cmd, ordinal, created_seq, updated_seq)"
                     " VALUES(?, 'problem', NULL, ?, ?, ?, 0, 'checklist', ?, ?, ?, ?, ?)",
-                    (f"P{i}", _clip(p["title"], 500), _clip(p.get("rationale", "")), status,
+                    (f"P{i}", _clip(p["title"], 500), str(p.get("rationale") or ""), status,
                      "checked in the input checklist" if status == "done" else "",
                      p.get("verify_cmd") or None, i, seq, seq))
             return {"title": title, "problems": len(problems)}
@@ -1225,7 +1242,7 @@ class Ledger:
                 # The checklist's note is written for the worker (e.g. the exact form of the answer): show it.
                 # The verify command itself is not shown: it may hold the expected answer.
                 if n["rationale"]:
-                    lines.append(f"{pad}note: " + n["rationale"].replace("\n", " | ")[:600])
+                    lines.append(f"{pad}note: " + note_preview(n["rationale"], n["id"]))
                 if n["status"] in OPEN:
                     if n["verify_cmd"]:
                         how = ("a verify command, run on propose_done; your candidate reaches it as $BEACON_CANDIDATE, "
