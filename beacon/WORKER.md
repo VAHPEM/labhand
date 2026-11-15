@@ -4,7 +4,9 @@ This session may be supervised by a **beacon run** (the SessionStart hook says s
 shows the ledger). When it is:
 
 - **The ledger is the plan.** Work the node the ledger names next. Before working on a
-  todo node, `start_node` it. Look at the whole ledger with `ledger_view`.
+  todo node, `start_node` it. Look at the whole ledger with `ledger_view`. A problem's
+  note is the human's instructions: when it ends in "(cut, N more chars)", read the rest
+  with `problem_note` before working on it.
 - **Record every option, don't offer it.** Whenever you think of another way to solve
   something — including "if you want, I could also …" — record it with `add_node`
   (a *solution* is a hypothesis under a problem; an *approach* is a concrete way to

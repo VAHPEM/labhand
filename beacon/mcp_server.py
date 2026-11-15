@@ -37,6 +37,14 @@ def ledger_view(node_id: str = "") -> str:
     return tools.ledger_view(node_id or None)
 
 
+@mcp.tool(annotations=ToolAnnotations(title="Problem note", readOnlyHint=True, destructiveHint=False,
+                                      idempotentHint=True, openWorldHint=False))
+def problem_note(node_id: str) -> str:
+    """One node's whole note, line breaks kept. ledger_view shows a long checklist note cut, saying
+    "(cut, N more chars)": read the rest here before working on that problem."""
+    return tools.problem_note(node_id)
+
+
 @mcp.tool(annotations=_write("Add node"))
 def add_node(parent: str, title: str, rationale: str = "", kind: str = "") -> str:
     """Record a new solution (hypothesis) under a problem, or an approach under a problem or solution.

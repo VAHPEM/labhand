@@ -53,6 +53,15 @@ def ledger_view(L, node_id=None):
 
 
 @_tool
+def problem_note(L, node_id):
+    """One node's whole note (a checklist problem's note is the human's instructions), with its line breaks."""
+    n = L.node(node_id)
+    if not n["rationale"]:
+        return f"{node_id} has no note."
+    return f"{node_id} \"{n['title']}\" — note ({len(n['rationale'])} chars):\n{n['rationale']}"
+
+
+@_tool
 def add_node(L, parent, title, rationale="", kind=None):
     nid = L.add_node(parent, title, rationale=rationale, kind=kind or None, actor="worker")
     return f"added {nid}"
@@ -193,5 +202,5 @@ def vm_check(L, host="kali", node_id="", set_baseline=False):
     return msg
 
 
-TOOLS = [ledger_view, add_node, start_node, attach_evidence, set_status, propose_done,
+TOOLS = [ledger_view, problem_note, add_node, start_node, attach_evidence, set_status, propose_done,
          claim_near_done, ask, mark_waiting, vm_check, propose_problem]

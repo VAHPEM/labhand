@@ -29,7 +29,7 @@ import re
 import shlex
 import sys
 
-from .ledger import DEFAULT_CONFIG, Ledger, LedgerError
+from .ledger import DEFAULT_CONFIG, NOTE_SHOW, Ledger, LedgerError
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -116,6 +116,11 @@ def cmd_init(args):
                       problems, config=cfg,
                       workdir=args.workdir or os.path.dirname(os.path.abspath(args.checklist)))
     print(f"created {L.path} with {len(problems)} problem(s)")
+    for i, p in enumerate(problems, 1):
+        size = len(str(p.get("rationale") or "").replace("\n", " | "))
+        if size > NOTE_SHOW:
+            print(f"warning: P{i}'s note is {size} characters; ledger_view shows the first {NOTE_SHOW} and says it "
+                  f"was cut. The worker reads the rest only if it calls problem_note(\"P{i}\").", file=sys.stderr)
     print(L.render_tree(evidence=False))
     print(f"\nLaunch the worker with:  BEACON_RUN={L.dir} claude")
 

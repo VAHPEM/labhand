@@ -172,9 +172,9 @@ def session_start(run, inp):
             f"A beacon run \"{L.title()}\" supervises this session (session start reason: {src or 'startup'}).",
             "The ledger below is the source of truth for what is done and what is left. "
             "The Stop gate keeps the session going while workable nodes remain.",
-            "Tools (beacon MCP server): ledger_view, add_node, start_node, attach_evidence, set_status, "
+            "Tools (beacon MCP server): ledger_view, problem_note, add_node, start_node, attach_evidence, set_status, "
             "propose_done, claim_near_done, ask, mark_waiting, vm_check, propose_problem.",
-            "", L.render_tree(max_evidence=2)[:6000],
+            "", _tree_for_start(L),
         ]
         for q in answered:
             parts.append(f"The human answered question #{q['id']} ({q['kind']}): {q['answer']}")
@@ -385,6 +385,13 @@ UNSUPERVISED = ("beacon is set up in this project, but this session was started 
 HANDLERS = {"stop": stop, "session-start": session_start, "pre-tool-use": pre_tool_use,
             "post-tool-use": post_tool_use, "stop-failure": stop_failure,
             "user-prompt-submit": user_prompt_submit}
+
+
+def _tree_for_start(L, limit=6000):
+    tree = L.render_tree(max_evidence=2)
+    if len(tree) <= limit:
+        return tree
+    return tree[:limit] + f"\n… (cut, {len(tree) - limit} more chars: ledger_view shows the whole ledger)"
 
 
 def _log_error(run, event):
