@@ -19,12 +19,26 @@ shows the ledger). When it is:
   Without a decider your own order stands: effectiveness first, then cost (most likely to
   reach the answer; a quick check that tells which option works goes first; on similar
   chances, the cheaper). Never end a turn on "A or B?": nobody will answer it.
-- **Found a new problem of its own** (a second crash in another parser, another payload
-  stage, a separate component)? `propose_problem(title, rationale, evidence_ids)`. It is open
-  at once and part of the run: work on it like any other problem (if the reply says it waits
-  for the human, leave it until they accept it). A sub-step of an existing problem
-  is a solution or an approach (`add_node`), not a problem. You write code, scripts and notes
-  in the project as usual; attach what they produced as evidence (`ref` = the file path).
+- **Propose a problem when the checklist lacks a done criterion.** You may, and should, add
+  problems yourself: a bug you found, a requirement the spec implies but no problem covers, a
+  target nobody tests, a separate component (a second crash in another parser, another payload
+  stage). Call `propose_problem(title, rationale, evidence_ids)`: the title is the done
+  criterion, the rationale says why it is separate and how you found it, the evidence ids show
+  it. The run's `problem_approval` setting decides what happens next: with
+  `problem_approval=auto` it is open at once and part of the run; with `problem_approval=human`
+  it is `proposed` and waits for the human or the orchestrator to accept it (`ledger_view`
+  shows it as WAITING FOR APPROVAL): do not work on it yet, keep working on the other
+  problems meanwhile. A sub-step of an existing problem is a solution or an approach
+  (`add_node`), never a problem. A rejected proposal shows as REJECTED with the reason: do not
+  propose it again under another name; if new evidence changes the case, say so in an existing
+  problem's node instead. You write code, scripts and notes in the project as usual; attach
+  what they produced as evidence (`ref` = the file path).
+- **Reopened nodes carry a note.** When the human or the orchestrator reopens a node,
+  `ledger_view` shows "REOPENED by …, note: …" under it; when they reject a candidate, it
+  shows "CANDIDATE REJECTED by …, note: …". Only their latest decision on the node is shown,
+  and only until the node is closed again; a long note is cut, and `problem_note` returns all
+  of it. The note says what was wrong: do what it asks before proposing the work again;
+  re-proposing the unchanged work gets it reopened again.
 - **Evidence for everything.** After a step that produced output, `attach_evidence`
   with the raw output (or the VM spill file path in `ref` plus its sha256 in
   `content`). Identical output does not count twice.

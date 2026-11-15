@@ -40,8 +40,9 @@ def ledger_view(node_id: str = "") -> str:
 @mcp.tool(annotations=ToolAnnotations(title="Problem note", readOnlyHint=True, destructiveHint=False,
                                       idempotentHint=True, openWorldHint=False))
 def problem_note(node_id: str) -> str:
-    """One node's whole note, line breaks kept. ledger_view shows a long checklist note cut, saying
-    "(cut, N more chars)": read the rest here before working on that problem."""
+    """One node's whole note, line breaks kept, plus the whole text of the latest reopen note or rejection
+    from the human / orchestrator. ledger_view shows a long note cut, saying "(cut, N more chars)": read the
+    rest here before working on that node."""
     return tools.problem_note(node_id)
 
 

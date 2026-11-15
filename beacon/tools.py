@@ -10,7 +10,7 @@ the rule and can comply.
 import functools
 import os
 
-from .ledger import CHOICE_RULE, Ledger, LedgerError
+from .ledger import CHOICE_RULE, CLOSED, Ledger, LedgerError
 
 
 def _run(run=None):
@@ -66,9 +66,14 @@ def ledger_view(L, node_id=None):
 def problem_note(L, node_id):
     """One node's whole note (a checklist problem's note is the human's instructions), with its line breaks."""
     n = L.node(node_id)
+    hn = L.human_notes().get(node_id)
+    tail = ""
+    if hn and hn["full"] and (n["status"] not in CLOSED or hn["type"] == "reject_problem"):
+        label = {"reopen": "reopen note", "verify": "candidate rejection"}.get(hn["type"], "rejection")
+        tail = f"\n\nlatest {label} by {hn['actor']} ({len(hn['full'])} chars):\n{hn['full']}"
     if not n["rationale"]:
-        return f"{node_id} has no note."
-    return f"{node_id} \"{n['title']}\" — note ({len(n['rationale'])} chars):\n{n['rationale']}"
+        return f"{node_id} has no note." + tail
+    return f"{node_id} \"{n['title']}\" — note ({len(n['rationale'])} chars):\n{n['rationale']}" + tail
 
 
 @_tool
