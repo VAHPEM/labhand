@@ -188,4 +188,3 @@ dirs, `--check` reports drift). Never edit the copies.
 ## Research workspace
 
 For the feasibility-evidence study, read `research/CLAUDE.md` and `research/STATUS.md` first. API costs belong to the separate research harness; the deterministic `labhand` library still makes no model calls.
-
