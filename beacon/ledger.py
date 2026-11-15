@@ -50,6 +50,7 @@ PERMISSION_POLICIES = ("approve", "ask")
 NODE_STATUSES = ("todo", "in_progress", "done", "dead_end", "blocked",
                  "superseded", "abandoned")
 OPEN = ("todo", "in_progress")
+FORCE_FROM = ("in_progress", "blocked", "pending_verification")   # where the human may force a problem done
 # A node in one of these takes no new children and the worker cannot leave it.
 CLOSED = ("done", "dead_end", "superseded", "abandoned")
 QUESTION_KINDS = ("approach_choice", "need_info", "need_permission")
@@ -883,24 +884,68 @@ class Ledger:
             raise LedgerError(f"{problem_id} is {p['status']}, not pending_verification")
 
         def apply(cur, seq):
-            new = "done" if accept else "in_progress"
-            cur.execute("UPDATE nodes SET status=?, reason=?, updated_seq=? WHERE id=?",
-                        (new, _clip(note or ("verified" if accept else "verification failed")),
-                         seq, problem_id))
-            closed, dropped = [], []
-            if accept:  # nothing under a solved problem is still open work, or still waiting on the human
-                for nid in self.subtree_ids(problem_id)[1:]:
-                    row = cur.execute("SELECT status FROM nodes WHERE id=?", (nid,)).fetchone()
-                    if row[0] in OPEN or row[0] == "blocked":
-                        cur.execute("UPDATE nodes SET status='superseded', reason=?, blocked_by_question=NULL,"
-                                    " updated_seq=? WHERE id=?", (f"{problem_id} verified done", seq, nid))
-                        closed.append(nid)
-                dropped = self._drop_questions(cur, problem_id, f"{problem_id} was solved")
-            # A refuted candidate is information too: it rules something out.
-            self._bump(cur, "progress")
-            return {"id": problem_id, "accepted": bool(accept), "note": note, "closed": closed, "dropped": dropped}
+            return self._settle(cur, seq, problem_id, accept, note)
 
         return self._mutate(actor, "verify", apply)
+
+    def _settle(self, cur, seq, problem_id, accept, note):
+        """Mark a problem done (accept) or back in progress, inside a transaction."""
+        new = "done" if accept else "in_progress"
+        cur.execute("UPDATE nodes SET status=?, reason=?, blocked_by_question=NULL, updated_seq=? WHERE id=?",
+                    (new, _clip(note or ("verified" if accept else "verification failed")), seq, problem_id))
+        closed, dropped = [], []
+        if accept:  # nothing under a solved problem is still open work, or still waiting on the human
+            for nid in self.subtree_ids(problem_id)[1:]:
+                row = cur.execute("SELECT status FROM nodes WHERE id=?", (nid,)).fetchone()
+                if row[0] in OPEN or row[0] == "blocked":
+                    cur.execute("UPDATE nodes SET status='superseded', reason=?, blocked_by_question=NULL,"
+                                " updated_seq=? WHERE id=?", (f"{problem_id} verified done", seq, nid))
+                    closed.append(nid)
+            dropped = self._drop_questions(cur, problem_id, f"{problem_id} was solved")
+        # A refuted candidate is information too: it rules something out.
+        self._bump(cur, "progress")
+        return {"id": problem_id, "accepted": bool(accept), "note": note, "closed": closed, "dropped": dropped}
+
+    def force_verify(self, problem_id, note, actor="human"):
+        """The human declares a problem done without (or against) its verify command -- the way past a wrong
+        command, which otherwise keeps a problem out of pending_verification for good (propose_done runs it at
+        once). From in_progress, blocked or pending_verification; the reason is required and recorded."""
+        if actor != "human":
+            raise LedgerError("only the human can force a verification")
+        p = self.node(problem_id)
+        if p["kind"] != "problem":
+            raise LedgerError(f"{problem_id} is not a problem")
+        if p["status"] not in FORCE_FROM:
+            raise LedgerError(f"{problem_id} is {p['status']}; a forced verify works from "
+                              + ", ".join(FORCE_FROM))
+        note = (note or "").strip()
+        if len(note) < MIN_REASON:
+            raise LedgerError(f"a forced verify needs the reason (at least {MIN_REASON} characters)")
+
+        def apply(cur, seq):
+            out = self._settle(cur, seq, problem_id, True, "forced by the human: " + note)
+            return dict(out, forced=True, **{"from": p["status"]})
+
+        return self._mutate(actor, "verify_forced", apply)
+
+    def set_verify_cmd(self, problem_id, cmd, actor="human"):
+        """The human replaces a problem's verify command (a wrong one cannot be passed otherwise)."""
+        if actor != "human":
+            raise LedgerError("only the human can change a verify command")
+        p = self.node(problem_id)
+        if p["kind"] != "problem":
+            raise LedgerError(f"{problem_id} is not a problem")
+        cmd = (cmd or "").strip()
+        if not cmd:
+            raise LedgerError("the new verify command is empty")
+        if p["status"] in ("done", "abandoned"):
+            raise LedgerError(f"{problem_id} is {p['status']}; reopen it first")
+
+        def apply(cur, seq):
+            cur.execute("UPDATE nodes SET verify_cmd=?, updated_seq=? WHERE id=?", (cmd, seq, problem_id))
+            return {"id": problem_id, "had_command": bool(p["verify_cmd"])}
+
+        return self._mutate(actor, "set_verify", apply)
 
     def _drop_questions(self, cur, root_id, why):
         """Open questions about nodes under root_id no longer need the human (inside a transaction)."""

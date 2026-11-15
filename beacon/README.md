@@ -72,6 +72,21 @@ which check said no:
 
 If a verify command turns out wrong, see [Getting past a wrong verify command](#getting-past-a-wrong-verify-command).
 
+### Getting past a wrong verify command
+
+A problem with a `verify:` command never waits in `pending_verification`: `propose_done` runs the
+command at once, so a wrong command rejects correct work for ever and plain `beacon verify P1` has
+nothing to accept. Two ways out, both only for you:
+
+- `beacon verify P1 --force --note "the check greps the wrong directory"` (terminal), or
+  `beacon: verify P1 force the check greps the wrong directory` (chat): P1 is done, from
+  in_progress, blocked or pending_verification. The reason is required.
+- `beacon set-verify P1 'python3 -m pytest tests -q'` (terminal): replaces the command; it runs on
+  the worker's next `propose_done`.
+
+Both are recorded as the human (actor `human` in the hash chain). The terminal forms need a TTY and
+the PreToolUse guard refuses them from the worker's Bash; no MCP tool reaches them.
+
 ## Watching it — in the Claude Code chat or in a terminal
 
 **In the chat (interactive `beacon claude`).** Every hook returns a one-line `systemMessage`,
@@ -99,6 +114,7 @@ Type to beacon in the same chat box (the UserPromptSubmit hook reads it before C
 | **Decide** — recorded as yours (actor `human` in the hash chain), then passed on to Claude with a note, so it carries on | |
 | `beacon: answer 3 use the arm64 image`, or `#3 use the arm64 image` | answer question 3 (a plain reply also counts when Claude stopped to wait for you and exactly one question is open; beacon says so) |
 | `beacon: verify P1` / `beacon: verify P1 reject wrong format` | accept / reject a candidate; an unclear word is refused, never read as "accept" |
+| `beacon: verify P1 force <why>` | declare P1 done past a wrong verify command (see below); the reason is required |
 | `beacon: add P1 <idea>` / `beacon: add P1.S1 approach <idea>` | your own hypothesis / approach, high priority, marked "● you" |
 | `beacon: reopen P1.A2 [note]` | reopen a closed node |
 | `beacon: abandon P2 <why>` | drop a problem or node |

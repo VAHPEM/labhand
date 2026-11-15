@@ -5,6 +5,8 @@
     python3 -m beacon status | report | graph | check        look at it
     python3 -m beacon answer QID "text"                      answer a question
     python3 -m beacon verify P1 [--reject "why"]             accept / refute a candidate
+    python3 -m beacon verify P1 --force --note "why"         declare P1 done past its verify command
+    python3 -m beacon set-verify P1 'CMD'                    replace P1's verify command
     python3 -m beacon reopen NODE                            undo a closed/blocked node
     python3 -m beacon config [key=value ...]                 show / change budgets
     python3 -m beacon hooks-config                           settings.json + .mcp.json snippets
@@ -208,12 +210,28 @@ def cmd_answer(args):
 
 def cmd_verify(args):
     _require_terminal("verify")
-    accept = args.reject is None
     L = _open(args)
+    if args.force:
+        if args.reject is not None:
+            raise LedgerError("--force accepts; it cannot be combined with --reject")
+        if not (args.note or "").strip():
+            raise LedgerError('--force needs the reason: --note "<why>"')
+        r = L.force_verify(args.problem, args.note, actor="human")
+        from .chat import dropped_note
+        print(f"{args.problem} forced done (was {r['from']})" + dropped_note(L, r.get("dropped")))
+        return
+    accept = args.reject is None
     r = L.verify(args.problem, accept, args.reject if not accept else (args.note or "verified by human"),
                  actor="human") or {}
     from .chat import dropped_note
     print(f"{args.problem} " + ("accepted" if accept else "rejected") + (dropped_note(L, r.get("dropped")) if accept else ""))
+
+
+def cmd_set_verify(args):
+    _require_terminal("set-verify")
+    L = _open(args)
+    L.set_verify_cmd(args.problem, args.command, actor="human")
+    print(f"{args.problem}: verify command replaced; it runs on the worker's next propose_done")
 
 
 def cmd_reopen(args):
@@ -444,7 +462,14 @@ def build_parser():
     p.add_argument("problem")
     p.add_argument("--reject", metavar="WHY")
     p.add_argument("--note")
+    p.add_argument("--force", action="store_true",
+                   help="declare it done without its verify command (from in_progress, blocked or "
+                        "pending_verification); needs --note with the reason")
     p.set_defaults(fn=cmd_verify)
+    p = with_run(sub.add_parser("set-verify", help="replace a problem's verify command"))
+    p.add_argument("problem")
+    p.add_argument("command")
+    p.set_defaults(fn=cmd_set_verify)
     p = with_run(sub.add_parser("reopen"))
     p.add_argument("node")
     p.add_argument("--note")
