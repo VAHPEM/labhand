@@ -11,9 +11,14 @@ Writes, inside DIR only, merging with whatever is already there:
 
 Existing files are copied to <file>.beacon-bak once (an earlier backup is kept).
 Nothing is removed from an existing file: other hooks, servers, rules and text stay.
+
+`beacon teardown-project DIR` is the inverse: it removes exactly what setup wrote (the rules block,
+beacon's hooks / allow / deny entries, the beacon MCP server, .claude/beacon) and keeps everything
+else; a file left with nothing in it is removed. Backups as above.
 """
 import json
 import os
+import re
 import shutil
 
 from .shellrun import posix_path
@@ -28,7 +33,7 @@ HOOK_EVENTS = (("Stop", "stop", 300), ("SessionStart", "session-start", 30),
 PROTECT_DENY = ("Edit(**/ledger.db*)", "Bash(sqlite3 *)", "Edit(**/.claude/settings.json)",
                 "Edit(**/.claude/settings.local.json)", "Edit(**/.mcp.json)", "Edit(**/.claude/beacon)") + tuple(
     f"Bash(.claude/beacon {c} *)" for c in ("answer", "verify", "set-verify", "reopen", "config", "lighthouse",
-                                            "init", "setup-project"))
+                                            "init", "setup-project", "teardown-project"))
 WRAPPER = """#!/bin/sh
 # beacon, for `! .claude/beacon ...` in the Claude Code chat (and any terminal in this project).
 # Written by `beacon setup-project`. The commands that act as the human (answer, verify, ...) need a terminal.
@@ -214,4 +219,159 @@ def setup_project(project, python, mcp_python, shared=False, allow_labhand=False
     if ch:
         _write(cp, new_text, dry_run)
         changes += [f"CLAUDE.md: {c}" for c in ch]
+    return changes
+
+
+# ---------------------------------------------------------------- teardown
+BEACON_HOOK = re.compile(r"-m\s+beacon\.hooks\b")
+
+
+def _ours_allow(rule):
+    return rule == "mcp__beacon" or str(rule).startswith("mcp__beacon__")
+
+
+def _ours_deny(rule):
+    # every rule setup has ever written: the current set, and any `.claude/beacon <cmd>` rule of an older version
+    return rule in PROTECT_DENY or str(rule).startswith("Bash(.claude/beacon ")
+
+
+def strip_settings(settings):
+    """Return (new_settings, changes): beacon's hooks, allow and deny rules removed, the rest kept."""
+    s = json.loads(json.dumps(settings or {}))
+    changes = []
+    hooks = s.get("hooks")
+    if isinstance(hooks, dict):
+        for event in list(hooks):
+            groups = hooks[event]
+            if not isinstance(groups, list):
+                continue
+            kept_groups = []
+            for g in groups:
+                inner = g.get("hooks") if isinstance(g, dict) else None
+                if not isinstance(inner, list):
+                    kept_groups.append(g)
+                    continue
+                kept = [h for h in inner if not (isinstance(h, dict) and BEACON_HOOK.search(str(h.get("command", ""))))]
+                if len(kept) != len(inner):
+                    changes.append(f"removed {event} hook")
+                if kept:
+                    kept_groups.append(dict(g, hooks=kept))
+            if kept_groups:
+                hooks[event] = kept_groups
+            else:
+                del hooks[event]
+        if not hooks:
+            del s["hooks"]
+    perms = s.get("permissions")
+    if isinstance(perms, dict):
+        for key, ours in (("allow", _ours_allow), ("deny", _ours_deny)):
+            rules = perms.get(key)
+            if not isinstance(rules, list):
+                continue
+            gone = [r for r in rules if ours(r)]
+            if gone:
+                perms[key] = [r for r in rules if not ours(r)]
+                changes += [f"removed {'allowed' if key == 'allow' else 'denied'} {r}" for r in gone]
+            if not perms[key]:
+                del perms[key]
+        if not perms:
+            del s["permissions"]
+    if changes and isinstance(perms, dict) and "mcp__labhand" in (perms.get("allow") or []):
+        # setup's --allow-labhand adds it, but a project may have had it before: setup does not record which
+        changes.append("kept allowed mcp__labhand (remove it by hand if it was only for beacon)")
+    servers = s.get("enabledMcpjsonServers")
+    if isinstance(servers, list) and "beacon" in servers:
+        s["enabledMcpjsonServers"] = [x for x in servers if x != "beacon"]
+        changes.append("removed beacon from enabledMcpjsonServers")
+        if not s["enabledMcpjsonServers"]:
+            del s["enabledMcpjsonServers"]
+    return s, changes
+
+
+def strip_mcp(cfg):
+    c = json.loads(json.dumps(cfg or {}))
+    servers = c.get("mcpServers")
+    if not isinstance(servers, dict) or "beacon" not in servers:
+        return c, []
+    del servers["beacon"]
+    if not servers:
+        del c["mcpServers"]
+    return c, ["removed beacon MCP server"]
+
+
+def strip_claude_md(text):
+    """Remove the worker-rules block (markers included) and the blank lines setup put around it."""
+    text = text or ""
+    if not (MARK_BEGIN in text and MARK_END in text and text.index(MARK_BEGIN) < text.index(MARK_END)):
+        return text, []
+    head, rest = text.split(MARK_BEGIN, 1)
+    _, tail = rest.split(MARK_END, 1)
+    head, tail = head.rstrip("\n"), tail.lstrip("\n")
+    new = head + ("\n\n" if head and tail else "") + tail
+    if new and not new.endswith("\n"):
+        new += "\n"
+    return new, ["removed worker rules from CLAUDE.md"]
+
+
+def _backup(path, dry_run):
+    if not dry_run and os.path.exists(path) and not os.path.exists(path + ".beacon-bak"):
+        shutil.copy2(path, path + ".beacon-bak")
+
+
+def _remove(path, dry_run):
+    if dry_run:
+        return
+    _backup(path, dry_run)
+    os.remove(path)
+
+
+def teardown_project(project, dry_run=False):
+    """Undo setup_project in DIR. -> the list of changes (what would change, with dry_run)."""
+    project = os.path.abspath(os.path.expanduser(project))
+    if not os.path.isdir(project):
+        raise FileNotFoundError(f"no such project directory: {project}")
+    changes = []
+    for name in ("settings.json", "settings.local.json"):
+        sp = os.path.join(project, ".claude", name)
+        if not os.path.exists(sp):
+            continue
+        new, ch = strip_settings(_read_json(sp))
+        if not ch:
+            continue
+        rel = os.path.relpath(sp, project)
+        if new:
+            _write(sp, json.dumps(new, indent=2) + "\n", dry_run)
+        else:
+            _remove(sp, dry_run)
+            ch.append("removed the file (nothing else was in it)")
+        changes += [f"{rel}: {c}" for c in ch]
+
+    mp = os.path.join(project, ".mcp.json")
+    if os.path.exists(mp):
+        new, ch = strip_mcp(_read_json(mp))
+        if ch:
+            if new:
+                _write(mp, json.dumps(new, indent=2) + "\n", dry_run)
+            else:
+                _remove(mp, dry_run)
+                ch.append("removed the file (nothing else was in it)")
+            changes += [f".mcp.json: {c}" for c in ch]
+
+    wp = os.path.join(project, ".claude", "beacon")
+    if os.path.isfile(wp):
+        _remove(wp, dry_run)
+        changes.append(".claude/beacon: removed the in-chat command")
+
+    cp = os.path.join(project, "CLAUDE.md")
+    if os.path.exists(cp):
+        with open(cp, encoding="utf-8") as fh:
+            old = fh.read()
+        new_text, ch = strip_claude_md(old)
+        if ch:
+            if new_text.strip():
+                _write(cp, new_text, dry_run)
+            else:
+                _remove(cp, dry_run)
+                ch.append("removed the file (nothing else was in it)")
+            changes += [f"CLAUDE.md: {c}" for c in ch]
     return changes

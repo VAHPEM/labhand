@@ -320,3 +320,119 @@ def test_the_worker_cannot_answer_for_the_human(make_run):
             L.answer(1, "8080", actor=actor)
     assert not any("answer" in t.__name__ for t in tools.TOOLS)
     assert L.questions("open")
+
+
+# ---------------------------------------------------------------- 5. teardown-project
+import json  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
+
+
+def _project(tmp_path, with_content=True):
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    if with_content:
+        (proj / "CLAUDE.md").write_text("# My project\n\nKeep this text.\n")
+        (proj / ".claude" / "settings.local.json").write_text(json.dumps({
+            "model": "opus",
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "my-own-stop-hook"}]}]},
+            "permissions": {"allow": ["Bash(ls *)"], "deny": ["Bash(rm -rf *)"]}}))
+        (proj / ".mcp.json").write_text(json.dumps({"mcpServers": {"labhand": {"command": "labhand-mcp"}}}))
+    return proj
+
+
+def _snapshot(proj):
+    out = {}
+    for root, _, files in os.walk(proj):
+        for f in files:
+            p = os.path.join(root, f)
+            if not p.endswith(".beacon-bak"):
+                out[os.path.relpath(p, proj)] = open(p, encoding="utf-8").read()
+    return out
+
+
+def _json_or_text(rel, text):
+    return json.loads(text) if rel.endswith(".json") else text
+
+
+def test_teardown_undoes_setup_and_keeps_everything_else(tmp_path):
+    from beacon.project import setup_project, teardown_project
+    proj = _project(tmp_path)
+    before = _snapshot(proj)
+    assert setup_project(str(proj), sys.executable, sys.executable)
+    assert (proj / ".claude" / "beacon").exists()
+    changes = teardown_project(str(proj))
+    assert any("removed Stop hook" in c for c in changes) and any("worker rules" in c for c in changes)
+    after = _snapshot(proj)
+    assert set(after) == set(before)
+    for rel in before:
+        assert _json_or_text(rel, after[rel]) == _json_or_text(rel, before[rel]), rel
+    assert (proj / "CLAUDE.md.beacon-bak").read_text() == before["CLAUDE.md"]     # setup's backup is kept
+    assert teardown_project(str(proj)) == []                                        # nothing left to undo
+
+
+def test_teardown_of_a_fresh_project_removes_the_files_setup_created(tmp_path):
+    from beacon.project import setup_project, teardown_project
+    proj = _project(tmp_path, with_content=False)
+    setup_project(str(proj), sys.executable, sys.executable, shared=True)
+    teardown_project(str(proj))
+    assert _snapshot(proj) == {}
+    assert (proj / ".mcp.json.beacon-bak").exists()                  # what was removed is backed up
+
+
+def test_teardown_strips_both_settings_files_and_old_deny_rules(tmp_path):
+    from beacon.project import strip_settings
+    s = {"permissions": {"allow": ["mcp__beacon", "mcp__beacon__ledger_view", "mcp__labhand", "Read"],
+                         "deny": ["Bash(.claude/beacon answer *)", "Bash(.claude/beacon some-old-cmd *)",
+                                  "Edit(**/ledger.db*)", "Bash(curl *)"]},
+         "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+             {"type": "command", "command": 'PYTHONPATH="/x" "/py" -m beacon.hooks pre-tool-use'},
+             {"type": "command", "command": "mine"}]}]},
+         "enabledMcpjsonServers": ["beacon", "labhand"]}
+    new, ch = strip_settings(s)
+    assert new == {"permissions": {"allow": ["mcp__labhand", "Read"], "deny": ["Bash(curl *)"]},
+                   "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "mine"}]}]},
+                   "enabledMcpjsonServers": ["labhand"]}
+    assert "removed PreToolUse hook" in ch and any(c.startswith("kept allowed mcp__labhand") for c in ch)
+
+
+def test_strip_claude_md_boundaries():
+    from beacon.project import MARK_BEGIN, MARK_END, strip_claude_md
+    block = f"{MARK_BEGIN}\nrules\n{MARK_END}"
+    assert strip_claude_md("no block here\n") == ("no block here\n", [])
+    assert strip_claude_md(f"{MARK_END}\nx\n{MARK_BEGIN}\n")[1] == []              # markers out of order: untouched
+    assert strip_claude_md(block + "\n")[0] == ""
+    assert strip_claude_md(f"top\n\n{block}\n\nbottom\n")[0] == "top\n\nbottom\n"
+    assert strip_claude_md(f"top\n\n{block}\n")[0] == "top\n"
+
+
+def test_teardown_dry_run_changes_nothing(tmp_path):
+    from beacon.project import setup_project, teardown_project
+    proj = _project(tmp_path)
+    setup_project(str(proj), sys.executable, sys.executable)
+    wired = _snapshot(proj)
+    assert teardown_project(str(proj), dry_run=True)
+    assert _snapshot(proj) == wired
+
+
+def test_teardown_cli_needs_a_terminal_and_the_worker_cannot_run_it(tmp_path, no_tty, capsys, make_run):
+    from beacon.hooks import guard
+    from beacon.project import PROTECT_DENY, setup_project
+    proj = _project(tmp_path)
+    setup_project(str(proj), sys.executable, sys.executable)
+    wired = _snapshot(proj)
+    assert cli.main(["teardown-project", str(proj)]) == 2
+    assert "must be run from a terminal" in capsys.readouterr().err and _snapshot(proj) == wired
+    assert cli.main(["teardown-project", str(proj), "--dry-run"]) == 0              # a preview is fine
+    assert "Would change:" in capsys.readouterr().out
+    assert "for the human" in guard("Bash", {"command": f".claude/beacon teardown-project {proj}"},
+                                    [make_run().dir], {})
+    assert "Bash(.claude/beacon teardown-project *)" in PROTECT_DENY
+
+
+def test_teardown_cli_from_a_terminal(tmp_path, tty, capsys):
+    from beacon.project import setup_project
+    proj = _project(tmp_path)
+    setup_project(str(proj), sys.executable, sys.executable)
+    assert cli.main(["teardown-project", str(proj)]) == 0
+    assert "Changed:" in capsys.readouterr().out and not (proj / ".claude" / "beacon").exists()
