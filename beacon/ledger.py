@@ -91,6 +91,9 @@ DEFAULT_CONFIG = {
     "lighthouse_transcript_chars": 60000,       # so it can review the steps the worker took, recorded or not
     "no_web": False,             # PreToolUse denies WebSearch/WebFetch
     "verify_timeout": 100,       # runs inside the propose_done tool call: stay under Claude Code's 2-minute mark
+    # hidden: the worker never sees a verify command (it may hold a CTF answer), only its exit code and output;
+    # command: it sees the command too, in ledger_view and on a rejection (engineering runs)
+    "verify_visibility": "hidden",
     "max_wait_minutes": 120,
     "notify_cmd": "",            # run (shell) when the gate lets the run stop
     "rotate_every": 15,          # under the watchdog: forced continuations per session, then a fresh one
@@ -135,6 +138,9 @@ DEFAULT_CONFIG = {
 }
 
 FOLLOWUP_POLICIES = ("work", "propose", "off")
+VERIFY_VISIBILITY = ("hidden", "command")
+VERIFY_TAIL_LINES = 40       # of a verify command's output, shown with its exit code
+VERIFY_TAIL_CHARS = 3500     # and at most this much of it (the note is stored under MAX_TEXT)
 
 PERMISSION_MODES = ("", "default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions")
 
@@ -244,20 +250,37 @@ def _event_hash(prev, seq, ts, actor, etype, payload, digest):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def output_tail(text, lines=VERIFY_TAIL_LINES, chars=VERIFY_TAIL_CHARS):
+    """The last `lines` lines of a command's output (at most `chars` characters), saying what was left out."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    rows = (text or "").rstrip().splitlines()
+    keep = rows[-lines:]
+    while len(keep) > 1 and len("\n".join(keep)) > chars:
+        keep = keep[1:]
+    if keep and len(keep[0]) > chars:            # one huge line: its end
+        keep = ["…" + keep[0][-chars:]]
+    skipped = len(rows) - len(keep)
+    return (f"[… {skipped} earlier line(s) not shown]\n" if skipped > 0 else "") + "\n".join(keep)
+
+
 def run_verify(cmd, candidate, cwd, timeout=120):
     """Run a checklist verify command. The candidate reaches it ONLY through the
-    BEACON_CANDIDATE environment variable, never the command line. -> (ok, detail)"""
+    BEACON_CANDIDATE environment variable, never the command line. -> (ok, detail): the exit code and the
+    last VERIFY_TAIL_LINES lines of stdout and stderr together, in the order they were written (measured
+    2026-11-15: the worker got only the exit code and the last stderr line and could not tell which step failed)."""
     from .shellrun import run
     env = dict(os.environ)
     env["BEACON_CANDIDATE"] = candidate
     try:
-        r = run(cmd, cwd=cwd, env=env, timeout=timeout)       # sh, or Git Bash on Windows (as Claude Code)
-    except subprocess.TimeoutExpired:
-        return False, "verify_cmd timed out"
+        r = run(cmd, cwd=cwd, env=env, timeout=timeout, merge=True)   # sh, or Git Bash on Windows (as Claude Code)
+    except subprocess.TimeoutExpired as e:
+        tail = output_tail(e.output)
+        return False, f"verify_cmd timed out after {timeout} s" + (f"; its output so far:\n{tail}" if tail else "")
     except OSError as e:
         return False, f"verify_cmd could not run: {e}"
-    tail = ((r.stdout or "") + (r.stderr or ""))[-1500:]
-    return r.returncode == 0, f"exit {r.returncode}: {tail.strip()}"
+    tail = output_tail(r.stdout)
+    return r.returncode == 0, f"exit {r.returncode}" + (f"; its output (last lines):\n{tail}" if tail else " (no output)")
 
 
 class Ledger:
@@ -306,6 +329,8 @@ class Ledger:
         cfg.update(config or {})
         if cfg.get("permission_mode") not in PERMISSION_MODES:
             raise LedgerError(f"permission_mode must be one of {PERMISSION_MODES[1:]} (or empty)")
+        if cfg.get("verify_visibility") not in VERIFY_VISIBILITY:
+            raise LedgerError(f"verify_visibility must be one of {VERIFY_VISIBILITY}")
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         db = cls._connect(path)
         db.executescript(_SCHEMA)
@@ -425,6 +450,10 @@ class Ledger:
 
     def title(self):
         return self._meta_get("title", "")
+
+    def verify_visible(self):
+        """May the worker see verify commands (verify_visibility=command)?"""
+        return self.config().get("verify_visibility") == "command"
 
     def workdir(self):
         return self._meta_get("workdir", self.dir)
@@ -1211,6 +1240,8 @@ class Ledger:
             raise LedgerError(f"permission_policy must be one of {PERMISSION_POLICIES}")
         if key == "followup_policy" and value not in FOLLOWUP_POLICIES:
             raise LedgerError(f"followup_policy must be one of {FOLLOWUP_POLICIES}")
+        if key == "verify_visibility" and value not in VERIFY_VISIBILITY:
+            raise LedgerError(f"verify_visibility must be one of {VERIFY_VISIBILITY}")
 
         def apply(cur, seq):
             cfg = self._meta_read(cur, "config", {}) or {}
@@ -1240,9 +1271,12 @@ class Ledger:
             pad = "  " * (depth + 1)
             if n["kind"] == "problem":
                 # The checklist's note is written for the worker (e.g. the exact form of the answer): show it.
-                # The verify command itself is not shown: it may hold the expected answer.
+                # The verify command itself is not shown (it may hold the expected answer) unless the run says
+                # verify_visibility=command.
                 if n["rationale"]:
                     lines.append(f"{pad}note: " + note_preview(n["rationale"], n["id"]))
+                if n["verify_cmd"] and self.verify_visible():
+                    lines.append(f"{pad}verify: {n['verify_cmd']}")
                 if n["status"] in OPEN:
                     if n["verify_cmd"]:
                         how = ("a verify command, run on propose_done; your candidate reaches it as $BEACON_CANDIDATE, "

@@ -28,10 +28,11 @@ def git_bash():
     return None
 
 
-def run(cmd, cwd=None, env=None, timeout=None, input=None):
-    """-> subprocess.CompletedProcess with str stdout/stderr. Raises what subprocess.run raises."""
-    kw = dict(cwd=cwd, env=env, timeout=timeout, input=input, capture_output=True, text=True,
-              encoding="utf-8", errors="replace")
+def run(cmd, cwd=None, env=None, timeout=None, input=None, merge=False):
+    """-> subprocess.CompletedProcess with str stdout/stderr. Raises what subprocess.run raises.
+    merge=True: stderr goes into stdout in the order it was written (stderr is then None)."""
+    kw = dict(cwd=cwd, env=env, timeout=timeout, input=input, text=True, encoding="utf-8", errors="replace",
+              stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE)
     bash = git_bash()
     if bash:
         return subprocess.run([bash, "-c", cmd], **kw)
