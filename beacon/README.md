@@ -53,6 +53,25 @@ python3 -m beacon setup-project ~/ctf/fo13 --mcp-python ~/venvs/labhand/bin/pyth
 python3 -m beacon claude --run ~/beacon-runs/fo13   # interactive (= BEACON_RUN=… claude); `beacon watch` unattended
 ```
 
+### Verify commands
+
+`propose_done` runs the problem's `verify:` command at once. On a rejection the worker gets the
+exit code and the last 40 lines of the command's output (stdout and stderr together, in the order
+they were written). It does **not** see the command itself by default, since a CTF check may hold
+the answer. For an engineering run, where the command is just a test, show it too:
+`beacon init RUN --checklist … --set verify_visibility=command` (or later,
+`beacon config verify_visibility=command`). The command then appears in `ledger_view` and on
+each rejection.
+
+Make each step print why it fails. Otherwise the worker sees only an exit code and cannot tell
+which check said no:
+
+```bash
+  verify: ! grep -rn "import dualvm" . || { echo "P1: dualvm import left"; exit 1; }; python3 -m pytest tests -q || { echo "P1: tests red"; exit 1; }
+```
+
+If a verify command turns out wrong, see [Getting past a wrong verify command](#getting-past-a-wrong-verify-command).
+
 ## Watching it — in the Claude Code chat or in a terminal
 
 **In the chat (interactive `beacon claude`).** Every hook returns a one-line `systemMessage`,

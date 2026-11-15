@@ -96,11 +96,12 @@ def propose_done(L, problem_id, candidate, evidence_ids, summary=""):
         return f"{problem_id} VERIFIED and done. {r['detail']}"
     if r["verified"] is False:
         hint = ""
-        if r["detail"].strip().endswith(":"):           # "exit N:" and nothing after it: the verifier printed nothing
+        if r["detail"].endswith("(no output)"):            # the verifier printed nothing
             hint = (" It printed nothing, so the check itself said no: re-read the problem's note in ledger_view for "
                     "the exact form of the answer (often the bare value, not a sentence) before changing anything "
                     "else.")
-        return (f"{problem_id}: the verifier REJECTED the candidate ({r['detail']}). The problem is "
+        cmd = (f"\nThe verify command: {L.node(problem_id)['verify_cmd']}" if L.verify_visible() else "")
+        return (f"{problem_id}: the verifier REJECTED the candidate. {r['detail']}{cmd}\nThe problem is "
                 "back in progress; the refuted candidate is recorded." + hint)
     return f"{problem_id} is pending human verification. Continue with other open problems."
 
