@@ -11,6 +11,10 @@ id_*
 .mcp.json
 .claude/settings.local.json
 .claude/beacon
+# local study data and scratch output — never commit (this repo is public)
+/research/
+/output/
+/tmp/
 # python
 __pycache__/
 *.pyc

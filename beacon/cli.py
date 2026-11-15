@@ -523,9 +523,8 @@ def build_parser():
     p.add_argument("--python", help="python for the hooks (stdlib only; default: this interpreter)")
     p.add_argument("--mcp-python", help="python with the `mcp` package (default: --python)")
     p.add_argument("--shared", action="store_true", help="write .claude/settings.json instead of settings.local.json")
-    p.add_argument("--allow-labhand", "--allow-dualvm", dest="allow_labhand", action="store_true",
-                   help="also pre-approve every labhand MCP tool, under the server name labhand and the "
-                        "pre-rename dualvm (they act on the VMs; your call). --allow-dualvm is the old spelling")
+    p.add_argument("--allow-labhand", dest="allow_labhand", action="store_true",
+                   help="also pre-approve every labhand MCP tool (they act on the VMs; your call)")
     p.add_argument("--quiet-shell", action="store_true",
                    help="set respondToBashCommands=false: `! .claude/beacon log` output gets no model reply")
     p.add_argument("--dry-run", action="store_true")

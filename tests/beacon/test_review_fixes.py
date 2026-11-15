@@ -117,7 +117,6 @@ def test_guard_covers_the_wrapper_and_other_mcp_servers(make_run, tmp_path):
     assert "touches the beacon supervisor" in guard("mcp__fs__write_file",
                                                     {"path": os.path.join(L.dir, "ledger.db"), "content": "x"}, roots, {})
     assert guard("mcp__beacon__ledger_view", {}, roots, {}) is None
-    assert guard("mcp__dualvm__run_cmd", {"command": "file /home/kali/samples/a.exe"}, roots, {}) is None
     assert guard("mcp__labhand__run_cmd", {"command": "file /home/kali/samples/a.exe"}, roots, {}) is None
 
 

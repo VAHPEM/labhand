@@ -43,7 +43,7 @@ def test_setup_project_end_to_end(tmp_path):
     s = json.loads((proj / ".claude" / "settings.local.json").read_text())
     assert s["permissions"]["deny"][0] == "Read(.env)" and "mcp__beacon" in s["permissions"]["allow"]
     assert "Edit(**/ledger.db*)" in s["permissions"]["deny"] and "Bash(sqlite3 *)" in s["permissions"]["deny"]
-    assert "mcp__dualvm" not in s["permissions"]["allow"]
+    assert "mcp__labhand" not in s["permissions"]["allow"]
     assert (proj / ".claude" / "settings.local.json.beacon-bak").exists()
     m = json.loads((proj / ".mcp.json").read_text())
     assert m["mcpServers"]["beacon"]["command"] == "/venv/bin/python"
@@ -136,18 +136,19 @@ def test_shellrun_runs_posix_shell_and_decodes_utf8(tmp_path):
     assert r.returncode == 0 and r.stdout == "mũi tên ▸"
 
 
-@pytest.mark.parametrize("kw", [{"allow_labhand": True}, {"allow_dualvm": True}])
-def test_allow_labhand_preapproves_both_server_names(tmp_path, kw):
+def test_allow_labhand_preapproves_the_labhand_server_only(tmp_path):
     proj = tmp_path / "proj"
     proj.mkdir()
-    setup_project(str(proj), "/usr/bin/python3", "/venv/bin/python", **kw)
+    setup_project(str(proj), "/usr/bin/python3", "/venv/bin/python", allow_labhand=True)
     allow = json.loads((proj / ".claude" / "settings.local.json").read_text())["permissions"]["allow"]
-    assert {"mcp__beacon", "mcp__labhand", "mcp__dualvm"} <= set(allow)
+    assert allow == ["mcp__beacon", "mcp__labhand"]
+    with pytest.raises(TypeError):
+        setup_project(str(proj), "/usr/bin/python3", "/venv/bin/python", allow_dualvm=True)
 
 
-@pytest.mark.parametrize("flag", ["--allow-labhand", "--allow-dualvm"])
-def test_cli_allow_flag_and_its_old_spelling(flag):
+def test_cli_allow_labhand_flag_and_no_dualvm_spelling(capsys):
     from beacon.cli import build_parser
-    args = build_parser().parse_args(["setup-project", "/p", flag])
-    assert args.allow_labhand is True
+    assert build_parser().parse_args(["setup-project", "/p", "--allow-labhand"]).allow_labhand is True
     assert build_parser().parse_args(["setup-project", "/p"]).allow_labhand is False
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["setup-project", "/p", "--allow-dualvm"])
