@@ -165,14 +165,12 @@ def _write(path, content, dry_run):
 
 
 def setup_project(project, python, mcp_python, shared=False, allow_labhand=False, dry_run=False,
-                  quiet_shell=False, allow_dualvm=False):
+                  quiet_shell=False):
     project = os.path.abspath(os.path.expanduser(project))
     if not os.path.isdir(project):
         raise FileNotFoundError(f"no such project directory: {project}")
     changes = []
-    # The lab's MCP server is registered as "labhand" now, "dualvm" in configs from before the rename:
-    # pre-approving the lab means both prefixes. allow_dualvm is the old name of allow_labhand.
-    allow = ("mcp__beacon", "mcp__labhand", "mcp__dualvm") if (allow_labhand or allow_dualvm) else ("mcp__beacon",)
+    allow = ("mcp__beacon", "mcp__labhand") if allow_labhand else ("mcp__beacon",)
 
     sp = os.path.join(project, ".claude", "settings.json" if shared else "settings.local.json")
     other = os.path.join(project, ".claude", "settings.local.json" if shared else "settings.json")
