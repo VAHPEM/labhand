@@ -45,10 +45,20 @@ def _tool(fn):
 
 @_tool
 def ledger_view(L, node_id=None):
-    """The ledger as a tree (or one node's subtree), with recent evidence."""
+    """The ledger as a tree (or one node's subtree), with recent evidence, and the answers to questions
+    this session has not seen yet."""
     head = f"Run: {L.title()}\n"
     nxt = L.next_node()
     tail = f"\n\nNext node by the ledger's ordering: {nxt['id']} \"{nxt['title']}\"" if nxt else ""
+    # An answer given while the session runs (the orchestrator answers through the ledger, not the chat)
+    # used to reach the worker only at the next session start or a blocked stop: the worker saw its node
+    # reopened without the answer and asked again (measured 2026-11-15). Deliver it on the next look.
+    answered = [q for q in L.questions("answered") if not q["delivered"]]
+    if answered:
+        tail += ("\n\nAnswers to your questions, new since you last looked (from the human, or the orchestrator "
+                 "acting for them):\n" + "\n".join(f"#{q['id']} ({q['kind']}): {q['question']}\n  -> {q['answer']}"
+                                                  for q in answered))
+        L.mark_delivered([q["id"] for q in answered], actor="worker")
     return head + L.render_tree(root=node_id or None, max_evidence=3) + tail
 
 

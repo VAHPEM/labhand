@@ -136,3 +136,15 @@ def test_by_default_running_a_real_sample_is_approved_like_anything_else(make_ru
     assert out.startswith("Approved") and not L.questions("open")
     from beacon import decider
     assert "ask_before_running_real_samples" not in decider.system_prompt(L.config())
+
+
+def test_ledger_view_delivers_answers_given_while_the_session_runs(make_run):
+    L = make_run()
+    run = L.dir
+    a = L.add_node("P1", "read the config loader", kind="approach")
+    qid = L.ask("need_info", "Which port should the server use?", node_id=a)["qid"]
+    L.answer(qid, "8742", actor="orchestrator")
+    out = tools.ledger_view(run=run)
+    assert "Answers to your questions" in out and "Which port should the server use?" in out and "-> 8742" in out
+    assert "Answers to your questions" not in tools.ledger_view(run=run)      # delivered once
+    assert all(q["delivered"] for q in L.questions("answered"))
