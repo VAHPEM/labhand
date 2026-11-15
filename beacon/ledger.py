@@ -195,6 +195,19 @@ def note_preview(note, node_id):
             "returns the whole note)")
 
 
+HUMAN_NOTE_SHOW = 400   # a reopen / rejection note in the tree (and so in every gate and decider prompt)
+
+
+def human_note_preview(note, node_id):
+    """A human / orchestrator decision note on one line, at most HUMAN_NOTE_SHOW characters; blank lines and
+    indentation collapse. When cut, it says that problem_note returns the whole text."""
+    flat = " | ".join(ln.strip() for ln in (note or "").splitlines() if ln.strip())
+    if len(flat) <= HUMAN_NOTE_SHOW:
+        return flat
+    return (flat[:HUMAN_NOTE_SHOW] + f" … (cut, {len(flat) - HUMAN_NOTE_SHOW} more chars: problem_note(\"{node_id}\")"
+            " returns the whole note)")
+
+
 def _norm_title(title):
     return re.sub(r"[^0-9a-z]+", "", (title or "").lower())
 
@@ -1303,9 +1316,30 @@ class Ledger:
         """An audit-only event (lighthouse call, session start, ...)."""
         return self._mutate(actor, etype, lambda cur, seq: dict(payload))
 
+    def human_notes(self):
+        """{node_id: {"type", "note" (bounded one-line preview), "full", "actor"}}: the latest decision the human /
+        orchestrator made on each node, from the event log -- a reopen (with or without a note), a rejected
+        verification, or a rejected proposal. The newest one replaces any older one: a noteless reopen leaves
+        nothing to show, a verification rejection replaces the reopen note it answered. Callers show it only
+        while the node is not CLOSED (a node leaves CLOSED only through reopen(), which records a newer one)."""
+        out = {}
+        for e in self.db.execute("SELECT actor, type, payload FROM events WHERE type IN ('reopen', 'verify',"
+                                 " 'reject_problem') ORDER BY seq"):
+            p = json.loads(e["payload"])
+            if e["type"] == "verify" and (e["actor"] not in HUMAN_ACTORS or p.get("accepted")):
+                continue  # the verify command's verdict reaches the worker in propose_done's reply
+            full = _clip((p.get("note") or "").strip())
+            out[p.get("id")] = {"type": e["type"], "note": human_note_preview(full, p.get("id")), "full": full,
+                                "actor": e["actor"]}
+        return out
+
     # ------------------------------------------------------------ rendering
     def render_tree(self, root=None, evidence=True, max_evidence=3):
         lines = []
+        notes = self.human_notes()
+
+        def who(actor):
+            return "the orchestrator (acting for the human)" if actor == "orchestrator" else "the human"
 
         def walk(nid, depth):
             n = self.node(nid)
@@ -1335,7 +1369,22 @@ class Ledger:
                     else:
                         how = "the human"
                     lines.append(f"{pad}checked by: {how}")
-            if n["reason"] and n["status"] not in OPEN:
+            hn = notes.get(nid)
+            # Measured 2026-11-15: the orchestrator reopened a node with a note, the view did not show it (an open
+            # node's reason is hidden) and the worker re-proposed the unchanged work. The latest decision is shown
+            # until the node closes again.
+            if hn and hn["note"] and n["status"] not in CLOSED:
+                if hn["type"] == "reopen":
+                    lines.append(f"{pad}REOPENED by {who(hn['actor'])}, note: {hn['note']}")
+                elif hn["type"] == "verify":
+                    lines.append(f"{pad}CANDIDATE REJECTED by {who(hn['actor'])}, note: {hn['note']}")
+            if n["status"] == "proposed":
+                lines.append(f"{pad}WAITING FOR APPROVAL: a proposed problem; do not work on it until the human or "
+                             "the orchestrator accepts it (it becomes todo then)")
+            if hn and hn["type"] == "reject_problem" and n["status"] == "abandoned":
+                lines.append(f"{pad}REJECTED proposal, by {who(hn['actor'])}: {hn['note']} -- do not work on it "
+                             "or propose it again under another name")
+            elif n["reason"] and n["status"] not in OPEN:
                 lines.append(f"{pad}reason: {n['reason']}")
             if n["assumption"]:
                 lines.append(f"{pad}assumes: {n['assumption']}")
