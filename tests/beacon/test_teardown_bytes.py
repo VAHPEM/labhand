@@ -190,11 +190,12 @@ def test_teardown_roundtrip_fresh_project_files_removed(tmp_path):
 
 
 def test_teardown_roundtrip_second_cycle_ignores_the_first_cycles_backups(tmp_path):
-    """Teardown's backups of removed files stay; a later setup must not resurrect them."""
+    """Files setup created hold only beacon's parts: teardown removes them and leaves no backup behind, so
+    a later setup has nothing to resurrect."""
     proj = _proj(tmp_path)
     _setup(proj)
     teardown_project(str(proj))
-    assert (proj / ".mcp.json.beacon-bak").exists() and (proj / ".claude" / "beacon.beacon-bak").exists()
+    assert not list(proj.glob("**/*.beacon-bak*"))
     _setup(proj)
     teardown_project(str(proj))
     assert _state(proj) == {}

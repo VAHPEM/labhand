@@ -11,6 +11,8 @@ id_*
 .mcp.json
 .claude/settings.local.json
 .claude/beacon
+# backups beacon setup/teardown keep (<file>.beacon-bak, .beacon-bak.old[.N])
+*.beacon-bak*
 # local study data and scratch output — never commit (this repo is public)
 /research/
 /output/

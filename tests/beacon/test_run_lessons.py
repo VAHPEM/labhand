@@ -367,7 +367,7 @@ def test_teardown_undoes_setup_and_keeps_everything_else(tmp_path):
     assert set(after) == set(before)
     for rel in before:
         assert _json_or_text(rel, after[rel]) == _json_or_text(rel, before[rel]), rel
-    assert (proj / "CLAUDE.md.beacon-bak").read_text() == before["CLAUDE.md"]     # setup's backup is kept
+    assert not list(proj.glob("**/*.beacon-bak"))          # every file is back to its backup: none is left
     assert teardown_project(str(proj)) == []                                        # nothing left to undo
 
 
@@ -377,7 +377,7 @@ def test_teardown_of_a_fresh_project_removes_the_files_setup_created(tmp_path):
     setup_project(str(proj), sys.executable, sys.executable, shared=True)
     teardown_project(str(proj))
     assert _snapshot(proj) == {}
-    assert (proj / ".mcp.json.beacon-bak").exists()                  # what was removed is backed up
+    assert not list(proj.glob("**/*.beacon-bak*"))      # they held only beacon's parts: nothing to back up
 
 
 def test_teardown_strips_both_settings_files_and_old_deny_rules(tmp_path):

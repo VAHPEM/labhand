@@ -12,15 +12,28 @@ Writes, inside DIR only (apart from the target of a symlinked file, below), merg
 A wired file that is a symlink (CLAUDE.md -> a shared file) is written through: the link stays a link and
 its target, wherever it lives, gets the change. A rewritten file keeps its permission bits.
 
-Existing files are copied to <file>.beacon-bak once (an earlier backup is kept).
-Nothing is removed from an existing file: other hooks, servers, rules and text stay.
+An existing file is copied to <file>.beacon-bak, and that backup is this run's pre-run state: a backup
+already there that equals the file (bytes and mode) is reused; one that differs from the unwired file is
+from an older run and is moved aside to a free <file>.beacon-bak.old[.N] (never deleted, never
+overwritten), then a fresh one is taken; a file that is still wired (an interrupted run) keeps its backup,
+the real pre-run state. Nothing is removed from an existing file: other hooks, servers, rules and text stay.
 
 `beacon teardown-project DIR` is the inverse: it removes exactly what setup wrote (the rules block,
-beacon's hooks / allow / deny entries, the beacon MCP server, .claude/beacon) and keeps everything
-else; a file left with nothing in it is removed. Backups as above. When what is left equals setup's
-.beacon-bak, the backup is put back byte for byte (line endings, trailing blank lines, JSON formatting,
-mode), so a run that changed nothing leaves no diff; a file setup created is removed; an edit the user
-made during the run outside beacon's parts is kept.
+beacon's hooks / allow / deny entries, the beacon MCP server, .claude/beacon when it is beacon's wrapper by
+content: any other file there is the project's and is never removed) and keeps everything else; a file
+setup created that is left with nothing in it is removed. When what is left equals setup's .beacon-bak, the backup
+is put back byte for byte (line endings, trailing blank lines, JSON formatting, mode), so a run that
+changed nothing leaves no diff; a file setup created is removed; an edit the user made during the run
+outside beacon's parts is kept (a file it rewrites with no backup is backed up first).
+
+Backups never outlive their use and never take the only copy of anything with them: after teardown a
+backup is removed only when the final file equals it (bytes and permission bits; for a symlink, the
+target's content, the link untouched); any other backup is kept and named in teardown's output with the
+reason and what it holds (the pre-run file, or teardown's own copy of a wired file). The older backups
+setup moved aside (.beacon-bak.old[.N]) are settled the same way: removed when the final file has their
+bytes, otherwise kept and named. A .claude/beacon backup that holds a beacon wrapper (an older version
+backed it up) is not a copy of anything the project owns: setup and teardown remove it, and it never
+stands in for the project's file. --dry-run reports the same verdicts.
 """
 import json
 import os
@@ -48,6 +61,9 @@ PYTHONPATH="{repo}${{PYTHONPATH:+{sep}$PYTHONPATH}}" exec "{python}" -m beacon "
 """
 MARK_BEGIN = "<!-- beacon:worker-rules:begin -->"
 MARK_END = "<!-- beacon:worker-rules:end -->"
+BAK = ".beacon-bak"
+WIRED = ("CLAUDE.md", ".mcp.json", os.path.join(".claude", "settings.local.json"),
+         os.path.join(".claude", "settings.json"), os.path.join(".claude", "beacon"))
 
 
 def hook_command(python, arg, repo=REPO):
@@ -173,12 +189,96 @@ def _target(path):
     return path
 
 
-def _write(path, content, dry_run):
+def _file_state(path):
+    """(bytes, permission bits) of the file at `path`, read through a symlink; None when it is missing or
+    unreadable (a directory, a dangling link)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(), stat.S_IMODE(os.fstat(fh.fileno()).st_mode)
+    except OSError:
+        return None
+
+
+def _free_name(base):
+    """`base`, or `base.1`, `base.2`, ...: the first name nothing (not even a dangling link) has."""
+    name, n = base, 0
+    while os.path.lexists(name):
+        n += 1
+        name = f"{base}.{n}"
+    return name
+
+
+def _is_wired(path, name=None):
+    """Does the file still hold what setup writes? True / False, None when it cannot be read or parsed.
+    name: the wired file's name when `path` is a copy of it (a backup)."""
+    name = name or os.path.basename(path)
+    try:
+        if name == "beacon":
+            with open(path, "rb") as fh:
+                return bool(BEACON_WRAPPER.search(fh.read()))
+        if name == "CLAUDE.md":
+            with open(path, encoding="utf-8") as fh:
+                return bool(strip_claude_md(fh.read())[1])
+        if name == ".mcp.json":
+            return bool(strip_mcp(_read_json(path))[1])
+        return bool(strip_settings(_read_json(path))[1])
+    except (OSError, ValueError):
+        return None
+
+
+def _setup_backup(path, dry_run):
+    """Make sure the backup this run uses is this run's pre-run state. -> messages.
+
+    No backup: one is taken of an existing file that is not wired; a file still wired with no backup was
+    created by an interrupted run (its pre-run state is "no file"), so none is taken. The file still wired
+    and a backup there (an interrupted run): the backup is the real pre-run state and stays. A backup equal
+    to the file (bytes and mode): reused. Otherwise the backup is from an older run: it is moved aside to a
+    free `<file>.beacon-bak.old[.N]` (never deleted, never overwriting anything) and a fresh one is taken;
+    when the file does not exist at all, setup creates it and there is no fresh backup to take. A
+    `.claude/beacon` backup holding a beacon wrapper is beacon's own file, not a copy of the project's: it
+    is removed first, and the project's file (if any) is backed up instead."""
+    bak = path + BAK
+    exists = os.path.exists(path)
+    wired = _is_wired(path) if exists else False
+    out = []
+    if os.path.basename(path) == "beacon" and _is_wrapper_backup(path):
+        # beacon's own command (an older version backed it up): no copy of anything the project owns, and it
+        # must not stand in for the project's file
+        if not dry_run:
+            os.remove(bak)
+        out.append(f"removed {os.path.basename(bak)}: it held beacon's own command, not a file of the project's")
+    if dry_run and out or not os.path.lexists(bak):
+        if exists and wired is not True and not dry_run:      # unknown: back it up, as setup always did
+            shutil.copy2(path, bak)
+        return out
+    if wired is not False or (exists and _file_state(path) == _file_state(bak)):
+        return out                                            # unknown: keep the backup as it is
+    old = _free_name(bak + ".old")
+    if not dry_run:
+        os.rename(bak, old)
+        if exists:
+            shutil.copy2(path, bak)
+    why = "it differed from the file" if exists else "the file did not exist"
+    fresh = f" and backed up the file to {os.path.basename(bak)}" if exists else ""
+    return [f"moved an older backup aside to {os.path.basename(old)} ({why}, so it is from an earlier run)"
+            + fresh]
+
+
+def _is_wrapper_backup(path):
+    """Is `path`.beacon-bak a regular file holding a beacon wrapper (beacon's own command)?"""
+    if os.path.islink(path + BAK) or not os.path.isfile(path + BAK):
+        return False
+    return _is_wired(path + BAK, "beacon") is True
+
+
+def _write(path, content, dry_run, backup=True):
+    """Write `content` to `path` (through a symlink, keeping the mode). backup: copy an existing file with
+    no backup to <file>.beacon-bak first (teardown); setup settles its backup in `_setup_backup` instead."""
     if dry_run:
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if os.path.exists(path) and not os.path.exists(path + ".beacon-bak"):
-        shutil.copy2(path, path + ".beacon-bak")
+    if backup and os.path.exists(path) and not os.path.lexists(path + BAK):
+        shutil.copy2(path, path + BAK)
     real = _target(path)
     tmp = real + ".beacon-tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -207,14 +307,14 @@ def setup_project(project, python, mcp_python, shared=False, allow_labhand=False
     changes += [f"{os.path.relpath(sp, project)}: {c}" for c in notes]
     ch = ch_real
     if ch:
-        _write(sp, json.dumps(new, indent=2) + "\n", dry_run)
-        changes += [f"{os.path.relpath(sp, project)}: {c}" for c in ch]
+        changes += [f"{os.path.relpath(sp, project)}: {c}" for c in ch + _setup_backup(sp, dry_run)]
+        _write(sp, json.dumps(new, indent=2) + "\n", dry_run, backup=False)
 
     mp = os.path.join(project, ".mcp.json")
     new, ch = merge_mcp(_read_json(mp), mcp_python)
     if ch:
-        _write(mp, json.dumps(new, indent=2) + "\n", dry_run)
-        changes += [f".mcp.json: {c}" for c in ch]
+        changes += [f".mcp.json: {c}" for c in ch + _setup_backup(mp, dry_run)]
+        _write(mp, json.dumps(new, indent=2) + "\n", dry_run, backup=False)
 
     wp = os.path.join(project, ".claude", "beacon")
     # the wrapper runs under sh / Git Bash; the separator is the one Python on this OS splits PYTHONPATH on
@@ -225,10 +325,11 @@ def setup_project(project, python, mcp_python, shared=False, allow_labhand=False
     except OSError:
         same = False
     if not same:
-        if not dry_run:
-            _write(wp, wrapper, dry_run)
-            os.chmod(wp, 0o755)
         changes.append(".claude/beacon: wrote the in-chat command (`! .claude/beacon log`)")
+        changes += [f".claude/beacon: {c}" for c in _setup_backup(wp, dry_run)]
+        if not dry_run:
+            _write(wp, wrapper, dry_run, backup=False)
+            os.chmod(wp, 0o755)
 
     cp = os.path.join(project, "CLAUDE.md")
     with open(os.path.join(REPO, "beacon", "WORKER.md"), encoding="utf-8") as fh:
@@ -239,8 +340,8 @@ def setup_project(project, python, mcp_python, shared=False, allow_labhand=False
             old = fh.read()
     new_text, ch = merge_claude_md(old, rules)
     if ch:
-        _write(cp, new_text, dry_run)
-        changes += [f"CLAUDE.md: {c}" for c in ch]
+        changes += [f"CLAUDE.md: {c}" for c in ch + _setup_backup(cp, dry_run)]
+        _write(cp, new_text, dry_run, backup=False)
     return changes
 
 
@@ -346,60 +447,199 @@ def strip_claude_md(text, original=None):
     return head + tail, ["removed worker rules from CLAUDE.md"]
 
 
-def _backup(path, dry_run):
-    if not dry_run and os.path.exists(path) and not os.path.exists(path + ".beacon-bak"):
-        shutil.copy2(path, path + ".beacon-bak")
-
-
 def _backup_text(path):
     """setup's backup of `path` read the way setup read the original, or None (none / not UTF-8 text)."""
     try:
-        with open(path + ".beacon-bak", encoding="utf-8") as fh:
+        with open(path + BAK, encoding="utf-8") as fh:
             return fh.read()
     except (OSError, UnicodeDecodeError):
         return None
 
 
-def _restore(path, dry_run):
-    """Put setup's backup back byte for byte (mode and mtime too); the backup itself stays."""
-    if not dry_run:
-        real = _target(path)                    # through a symlink: the link stays a link
-        tmp = real + ".beacon-tmp"
-        shutil.copy2(path + ".beacon-bak", tmp)
-        os.replace(tmp, real)
-
-
 def _json_backup(path):
     """The backup of a JSON file parsed like setup parsed the original, or None."""
-    if not os.path.isfile(path + ".beacon-bak"):
+    if not os.path.isfile(path + BAK):
         return None
     try:
-        return _read_json(path + ".beacon-bak")
+        return _read_json(path + BAK)
     except (OSError, ValueError):                 # UnicodeDecodeError and JSONDecodeError are ValueErrors
         return None
 
 
-def _put_json(path, new, ch, dry_run):
+class _Teardown:
+    """Teardown's file actions. With dry_run nothing is touched and `final` records what each file would
+    end up as, so the backup verdict of a dry run is the one the real run would reach. `made` holds the
+    files teardown backs up itself (no backup from setup: setup created the file), with the state the
+    backup has (or would have)."""
+
+    def __init__(self, dry_run):
+        self.dry_run = dry_run
+        self.final = {}
+        self.made = {}
+
+    def write(self, path, content):
+        """Rewrite the file without beacon's parts; a file with no backup is backed up first (`_write`)."""
+        if os.path.exists(path) and not os.path.lexists(path + BAK):
+            self.made[path] = _file_state(path)
+        if self.dry_run:
+            cur = _file_state(path)
+            self.final[path] = (content.encode("utf-8"), cur[1] if cur else 0o644)
+        else:
+            _write(path, content, False)
+
+    def restore(self, path):
+        """Put setup's backup back byte for byte (mode and mtime too); the link of a symlink stays a link.
+        The backup itself is settled afterwards, by `_settle_backups`."""
+        if self.dry_run:
+            self.final[path] = _file_state(path + BAK)
+            return
+        real = _target(path)
+        tmp = real + ".beacon-tmp"
+        shutil.copy2(path + BAK, tmp)
+        os.replace(tmp, real)
+
+    def remove(self, path):
+        """Remove a file that held nothing but beacon's parts (and whitespace): nothing in it needs a
+        backup; a backup setup took of it stays and is settled afterwards."""
+        if self.dry_run:
+            self.final[path] = None
+        else:
+            os.remove(_target(path))        # the file setup wrote through a symlink, not the link
+
+    def state(self, path):
+        if self.dry_run and path in self.final:
+            return self.final[path]
+        return _file_state(path)
+
+
+def _strip_json(path, obj):
+    """strip_mcp / strip_settings for the file at `path`, plus the empty `mcpServers` strip_mcp drops only
+    when it removed beacon from it. -> (stripped object, changes)."""
+    if os.path.basename(path) != ".mcp.json":
+        return strip_settings(obj)
+    c, ch = strip_mcp(obj)
+    if c.get("mcpServers") == {}:
+        del c["mcpServers"]
+    return c, ch
+
+
+def _same_as_backup(path, bak, new):
+    """Is the stripped object `new` what setup found (`bak`)? Exactly, or once the empty containers that
+    stripping drops are dropped from both: setup fills `{"mcpServers": {}}` or `"hooks": {}` and stripping
+    empties and removes them, which is no change of the user's. A backup that holds beacon's parts (a
+    stripped compare would put them back) is never a match this way."""
+    if json.dumps(bak) == json.dumps(new):
+        return True
+    norm_bak, wired = _strip_json(path, bak)
+    return not wired and json.dumps(norm_bak) == json.dumps(_strip_json(path, new)[0])
+
+
+def _put_json(path, new, ch, td):
     """Write the stripped JSON: the original's exact bytes when they hold the same object, serialised
     identically (key order, true vs 1, 1.0 vs 1 count: `==` on dicts ignores them, so a user's change of
-    them during the run would be lost), else the object itself; a file left with nothing in it (and none
-    before setup) is removed."""
+    them during the run would be lost) up to the empty containers stripping drops, else the object itself;
+    a file left with nothing in it is removed only when setup created it (no backup that matches)."""
     bak = _json_backup(path)
-    if bak is not None and json.dumps(bak) == json.dumps(new):
-        _restore(path, dry_run)
+    if bak is not None and _same_as_backup(path, bak, new):
+        td.restore(path)
         ch.append("restored the file as it was before setup")
     elif new:
-        _write(path, json.dumps(new, indent=2) + "\n", dry_run)
+        td.write(path, json.dumps(new, indent=2) + "\n")
     else:
-        _remove(path, dry_run)
+        td.remove(path)
         ch.append("removed the file (nothing else was in it)")
 
 
-def _remove(path, dry_run):
-    if dry_run:
-        return
-    _backup(path, dry_run)
-    os.remove(_target(path))        # the file setup wrote through a symlink, not the link
+def _old_backups(bak):
+    """The `<file>.beacon-bak.old[.N]` names setup moved older backups aside to, in order."""
+    d, base = os.path.split(bak)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    pat = re.compile(re.escape(base) + r"\.old(?:\.(\d+))?\Z")
+    found = [(int(m.group(1) or 0), n) for n in names for m in [pat.match(n)] if m]
+    return [os.path.join(d, n) for _, n in sorted(found)]
+
+
+def _settle_backups(project, td):
+    """After teardown: a backup the file is back to (bytes and permission bits, through a symlink) is
+    removed; any other backup is kept and named, with what it holds. The older backups setup moved aside
+    (`.beacon-bak.old[.N]`) are settled the same way: one whose bytes the final file has is removed, every
+    other one is kept and named. -> messages.
+
+    A backup is deleted only when the same bytes exist in the file it backs up, or when it holds nothing
+    but beacon's own command (`.claude/beacon` of an older version: no copy of anything the project owns).
+    A backup that is not a regular file is left alone and named."""
+    out = []
+    for rel in WIRED:
+        path = os.path.join(project, rel)
+        bak = path + BAK
+        name = rel + BAK
+        final = td.state(path)
+        if path in td.made:
+            have = td.made[path] if td.dry_run else _file_state(bak)
+        elif os.path.lexists(bak) and (os.path.islink(bak) or not os.path.isfile(bak)):
+            have = False
+        elif os.path.isfile(bak):
+            have = _file_state(bak)
+        else:
+            have = ()
+        teardowns = path in td.made or (have and _is_wired(bak, os.path.basename(path)) is True)
+        if have == ():
+            pass
+        elif have is False:
+            out.append(f"{name}: kept the backup: it is not a regular file, so it was left alone")
+        elif have is None:
+            out.append(f"{name}: kept the backup: it could not be read")
+        elif os.path.basename(path) == "beacon" and teardowns:
+            _drop(bak, td, out, f"{name}: removed the backup (it held beacon's own command, not a file of the "
+                                f"project's)")
+        elif final == have:
+            _drop(bak, td, out, f"{name}: removed the backup ({rel} is back to it byte for byte)",
+                  f"{name}: kept the backup: {rel} is back to it byte for byte, but removing it failed")
+        elif teardowns:
+            what = f"teardown's copy of {rel} taken before it removed beacon's parts" + (
+                "" if path in td.made else " (by a teardown that did not finish)")
+            gone = "" if final is not None else f"; {rel} was removed, so it holds the only copy of its content"
+            out.append(f"{name}: kept the backup: {what}; it holds changes made during the run{gone}")
+        elif final is None:
+            gone = "was removed" if td.dry_run or not os.path.lexists(path) else "cannot be read"
+            out.append(f"{name}: kept the backup: {rel} {gone}, so the backup holds the only copy of its content")
+        elif final[0] == have[0]:
+            out.append(f"{name}: kept the backup: same content as {rel}, but the permission bits differ "
+                       f"({final[1]:o} in the file, {have[1]:o} in the backup)")
+        else:
+            out.append(f"{name}: kept the backup: {rel} differs from it (edited during the run, or it could not "
+                       f"be restored), so it holds the file as it was before the run")
+        for old in _old_backups(bak):
+            oname = os.path.relpath(old, project)
+            if os.path.islink(old) or not os.path.isfile(old):
+                out.append(f"{oname}: kept older backup: not a regular file, so it was left alone")
+                continue
+            ostate = _file_state(old)
+            if ostate is None:
+                out.append(f"{oname}: kept older backup: it could not be read")
+            elif os.path.basename(path) == "beacon" and _is_wired(old, "beacon") is True:
+                _drop(old, td, out, f"{oname}: removed the older backup (it held beacon's own command, not a "
+                                    f"file of the project's)")
+            elif final is not None and final[0] == ostate[0]:
+                _drop(old, td, out, f"{oname}: removed the older backup ({rel} has the same bytes)",
+                      f"{oname}: kept older backup: {rel} has the same bytes, but removing it failed")
+            else:
+                why = f"differs from {rel}" if final is not None else f"{rel} does not exist"
+                out.append(f"{oname}: kept older backup: {why} (setup moved it aside: it is from an earlier run)")
+    return out
+
+
+def _drop(path, td, out, done, failed=None):
+    """Remove a settled backup (not with dry_run) and append `done`; on failure append `failed` instead."""
+    try:
+        if not td.dry_run:
+            os.remove(path)
+        out.append(done)
+    except OSError as e:
+        out.append(f"{failed or done.split(': ', 1)[0] + ': kept the backup: removing it failed'} ({e.strerror})")
 
 
 def teardown_project(project, dry_run=False):
@@ -408,6 +648,7 @@ def teardown_project(project, dry_run=False):
     if not os.path.isdir(project):
         raise FileNotFoundError(f"no such project directory: {project}")
     changes = []
+    td = _Teardown(dry_run)
     for name in ("settings.json", "settings.local.json"):
         sp = os.path.join(project, ".claude", name)
         if not os.path.exists(sp):
@@ -416,28 +657,24 @@ def teardown_project(project, dry_run=False):
         if not ch:
             continue
         rel = os.path.relpath(sp, project)
-        _put_json(sp, new, ch, dry_run)
+        _put_json(sp, new, ch, td)
         changes += [f"{rel}: {c}" for c in ch]
 
     mp = os.path.join(project, ".mcp.json")
     if os.path.exists(mp):
         new, ch = strip_mcp(_read_json(mp))
         if ch:
-            _put_json(mp, new, ch, dry_run)
+            _put_json(mp, new, ch, td)
             changes += [f".mcp.json: {c}" for c in ch]
 
     wp = os.path.join(project, ".claude", "beacon")
-    if os.path.isfile(wp):
-        try:
-            with open(wp + ".beacon-bak", "rb") as fh:
-                bak = fh.read()
-        except OSError:
-            bak = None
-        if bak is not None and not BEACON_WRAPPER.search(bak):
-            _restore(wp, dry_run)               # setup overwrote a file of the project's own: put it back
+    # only beacon's own command is touched; any other file there is the project's and stays as it is
+    if os.path.isfile(wp) and _is_wired(wp) is True:
+        if os.path.isfile(wp + BAK) and not _is_wrapper_backup(wp) and _file_state(wp + BAK) is not None:
+            td.restore(wp)                      # setup overwrote a file of the project's own: put it back
             changes.append(".claude/beacon: restored the project's own file setup had replaced")
         else:
-            _remove(wp, dry_run)
+            td.remove(wp)
             changes.append(".claude/beacon: removed the in-chat command")
 
     cp = os.path.join(project, "CLAUDE.md")
@@ -448,11 +685,12 @@ def teardown_project(project, dry_run=False):
         new_text, ch = strip_claude_md(old, bak)
         if ch:
             if bak is not None and bak == new_text:
-                _restore(cp, dry_run)           # exact bytes: line endings, a missing final newline, an empty file
+                td.restore(cp)                  # exact bytes: line endings, a missing final newline, an empty file
             elif new_text.strip():
-                _write(cp, new_text, dry_run)
+                td.write(cp, new_text)
             else:
-                _remove(cp, dry_run)
+                td.remove(cp)
                 ch.append("removed the file (nothing else was in it)")
             changes += [f"CLAUDE.md: {c}" for c in ch]
-    return changes
+    # last, so a failure in any step above leaves every backup where it was
+    return changes + _settle_backups(project, td)

@@ -27,7 +27,7 @@ without a virtualenv. Only the worker-facing MCP server needs the `mcp` package.
 | `report.py` | `REPORT.md` (near-done first, then what needs you) and a mermaid/HTML graph. |
 | `decider.py` | At a branch (`ask(kind="approach_choice")`), a separate model (Opus 5.5) ranks the options from the problem's ledger, evidence, the human's answers, the worker's brief and the session's observations (tool calls + outputs; `decider_transcript=full` adds the worker's prose). Its ranking orders the nodes; its reasons go into the ledger. Falls back to the worker's order without a key / over budget / on refusal or timeout. |
 | `classify.py` | A question the worker left as prose at a stop is read by Opus (`classifier_model`) with the problem's ledger and the session's observations: a choice is made on the spot, a request to run something is approved by your standing rule, only information you alone have comes to you; when the worker looks stuck it adds a step-back note. No key / over budget = keyword heuristic. |
-| `project.py` | `beacon setup-project DIR`: merges the hooks, an allow rule for the beacon MCP tools, the MCP server entry and the worker rules into a project (backups as `*.beacon-bak`; never installs the hooks twice across `settings.json` / `settings.local.json`); `beacon teardown-project DIR` removes exactly that again. |
+| `project.py` | `beacon setup-project DIR`: merges the hooks, an allow rule for the beacon MCP tools, the MCP server entry and the worker rules into a project (backups as `*.beacon-bak`, removed again by teardown once the file is back to them, the others kept and named; never installs the hooks twice across `settings.json` / `settings.local.json`); `beacon teardown-project DIR` removes exactly that again. |
 | `vmstate.py` | `vm_check` tool: fingerprints a VM through labhand (processes, listening ports, samples/ digest without labhand's `_*` files), keeps a baseline in the ledger and attaches each check as evidence, so a dead end shows whether the VM was clean. |
 | `evalkit.py` | `beacon eval`: runs a suite under `baseline` / `gate` / `gate_lh` / `gate_lh_alt` (lighthouse on another Claude model), isolated copies, web denied, success decided by the task's verify command; `results.jsonl` (resumable) + `summary.md`. |
 | `demo.py` | `beacon demo`: a toy practice run (three puzzles, `check.py`, `TESTING.md`) and `--auto`, a live smoke test of the whole cycle with the real Claude Code. |
@@ -95,11 +95,28 @@ the PreToolUse guard refuses them from the worker's Bash; no MCP tool reaches th
 - beacon's hooks, its `mcp__beacon` allow rule and its deny rules in `.claude/settings.json` and
   `.claude/settings.local.json`;
 - the beacon server in `.mcp.json`;
-- `.claude/beacon`.
+- `.claude/beacon`, when it is beacon's own command (by content); any other file there is the
+  project's and stays untouched (one setup replaced is put back from its backup).
 
-Everything else stays. A file left with nothing in it is removed. Changed or removed files are
-backed up as `*.beacon-bak`; a backup that already exists, such as the pre-setup copy
-`setup-project` made, is kept. An `mcp__labhand` allow rule is kept and reported: `setup-project
+Everything else stays. A file setup created that is left with nothing in it is removed; a file that
+held only an empty object or empty text before setup is put back. A file that is back to its
+pre-setup state is restored byte for byte from `setup-project`'s `<file>.beacon-bak`, and that backup
+is then removed: after a run that changed nothing, no `*.beacon-bak` is left. A backup is removed only
+when the final file equals it (bytes and permission bits; for a symlink, the target's content). Any
+other backup (the file was edited during the run, or could not be restored) is kept, and teardown names
+it and says why. A file `setup-project` created and the run edited is backed up before teardown rewrites
+it, and that backup is kept the same way. Every kept backup's message says what it holds: the file as
+it was before the run, or teardown's own copy taken before it removed beacon's parts. The older backups
+setup moved aside (`<file>.beacon-bak.old[.N]`) are settled too: one whose bytes the final file has is
+removed, every other one is kept and named; teardown's last line lists exactly the backups left behind.
+
+`setup-project` makes sure the backup is this run's pre-run state: a `<file>.beacon-bak` already there
+that differs from the (unwired) file is from an older run; it is moved aside to a free
+`<file>.beacon-bak.old` (`.old.1`, ...; never deleted, never overwritten) and a fresh backup is taken.
+A backup equal to the file is reused; a file still wired (an interrupted run) keeps its backup.
+A `.claude/beacon.beacon-bak` that holds a beacon wrapper (left by an older version) is not a copy of
+anything the project owns: setup and teardown remove it, and it never stands in for the project's file.
+An `mcp__labhand` allow rule is kept and reported: `setup-project
 --allow-labhand` adds it, but the project may have had it before. `--dry-run` shows what would
 change. The real run needs a terminal and is refused from the worker's Bash.
 
