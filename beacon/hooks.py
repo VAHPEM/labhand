@@ -220,9 +220,39 @@ def _under(path, roots):
     return any(rp == r or rp.startswith(r + os.sep) for r in roots)
 
 
-def guard(tool, tool_input, roots, cfg):
-    """Return a denial reason, or None to let the tool run."""
+# An agent definition can carry `permissionMode: bypassPermissions`: one the worker writes (project
+# .claude/agents or the user's ~/.claude/agents) would hand a subagent every permission. setup-project denies
+# the edit (PROTECT_DENY); this guard covers Bash and other MCP servers' file tools too.
+AGENTS_NEEDLE = ".claude/agents"
+AGENTS_DENIED = ("Agent definitions (.claude/agents in the project or your home) are off-limits during a beacon "
+                 "run: one could grant a subagent permissions the run does not have.")
+
+
+def _is_agent_definition(path):
+    """Is `path` (as written, or resolved through symlinks) inside some `.claude/agents` directory?
+    Compared case-insensitively: macOS file systems usually are."""
+    try:
+        forms = {os.path.abspath(os.path.expanduser(path)), os.path.realpath(os.path.expanduser(path))}
+    except (TypeError, ValueError):
+        return False
+    needle = os.sep + os.path.join(".claude", "agents") + os.sep
+    return any(needle.lower() in (f + os.sep).lower() for f in forms)
+
+
+SUBAGENT_DENIED = ("Only the main session talks to beacon: a subagent does not call the beacon tools. Return what "
+                   "you found (with the raw output) to the main session, which records it in the ledger.")
+
+
+def guard(tool, tool_input, roots, cfg, agent_id=None):
+    """Return a denial reason, or None to let the tool run.
+
+    agent_id: the PreToolUse input's `agent_id`, present (non-empty) only for a subagent's call. A subagent
+    inherits the beacon MCP tools, so "only the main session talks to beacon" is enforced here: every
+    mcp__beacon__ call of a subagent is denied. The main session has no agent_id (a session started with
+    an --agent option carries agent_type only), so it is never affected."""
     ti = tool_input or {}
+    if agent_id and tool.startswith(OWN_TOOL_PREFIX):
+        return SUBAGENT_DENIED
     if tool in WEB_TOOLS and cfg.get("no_web"):
         return "Web tools are disabled for this beacon run (no_web)."
     if tool in TASK_TOOLS and cfg.get("block_internal_tasks", True):
@@ -242,9 +272,13 @@ def guard(tool, tool_input, roots, cfg):
             if base == ".mcp.json" or (base in PROTECTED_NAMES + ("beacon",) and
                                         os.path.basename(os.path.dirname(os.path.abspath(p))) == ".claude"):
                 return "Claude Code settings and MCP configuration are off-limits during a beacon run."
+            if _is_agent_definition(p):
+                return AGENTS_DENIED
     if tool.startswith("mcp__") and not tool.startswith(OWN_TOOL_PREFIX):
         # another MCP server's tool (a filesystem or shell server) pointed at the supervisor's files
         blob = json.dumps(ti, ensure_ascii=False)
+        if AGENTS_NEEDLE in blob.lower().replace("\\\\", "/"):
+            return AGENTS_DENIED
         needles = {"ledger.db"} | {v for r in roots for v in _variants(r)}
         hit = next((n for n in needles if n and n in blob), None)
         if hit:
@@ -257,6 +291,8 @@ def guard(tool, tool_input, roots, cfg):
         if NESTED_CLAUDE.search(cmd):
             return ("Starting another Claude Code session is disabled during a beacon run; use the Agent tool "
                     "for a subagent.")
+        if AGENTS_NEEDLE in cmd.lower():
+            return AGENTS_DENIED
         needles = {"BEACON_RUN", "ledger.db", ".claude/settings", ".mcp.json"}
         for r in roots:
             needles |= _variants(r)
@@ -277,7 +313,9 @@ def pre_tool_use(run, inp):
             L.close()
     except Exception:  # noqa: BLE001
         _log_error(run, "pre-tool-use (config unreadable; path rules still applied)")
-    reason = guard(inp.get("tool_name", ""), inp.get("tool_input") or {}, protected_paths(run), cfg)
+    agent_id = inp.get("agent_id")
+    reason = guard(str(inp.get("tool_name", "")), inp.get("tool_input") or {}, protected_paths(run), cfg,
+                   agent_id=agent_id if isinstance(agent_id, str) and agent_id.strip() else None)
     if not reason:
         return None
     _append_jsonl(run, "denials.jsonl", {"ts": time.time(), "tool": inp.get("tool_name"), "reason": reason,

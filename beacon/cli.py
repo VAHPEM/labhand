@@ -313,7 +313,8 @@ def cmd_setup_project(args):
     if changes and not args.dry_run:
         print("Backups of files that existed: <file>.beacon-bak, this run's pre-run state (an older backup that "
               "differed was moved aside to <file>.beacon-bak.old, listed above). teardown-project removes each "
-              "backup (and .old) its file is back to and keeps and names the others.")
+              "backup (and .old) its file is back to or whose content is committed in git HEAD, and keeps and "
+              "names the others.")
         print("Next: beacon init <run> --checklist <file>, then BEACON_RUN=<run> claude  (or beacon watch)")
     return 0
 
@@ -333,8 +334,8 @@ def cmd_teardown_project(args):
         for c in changes:
             if c.split(":", 1)[0] in kept:
                 print("  " + c)
-        print(("Would keep " if args.dry_run else "Kept ") + ", ".join(kept) + ": each holds content its file does "
-              "not have, or could not be settled (reason above); delete it by hand once you do not need it.")
+        print(("Would keep " if args.dry_run else "Kept ") + ", ".join(kept) + ": each holds content neither its file "
+              "nor git HEAD has, or could not be settled (reason above); delete it by hand once you do not need it.")
     elif changes:
         print("No .beacon-bak or .beacon-bak.old " + ("would be" if args.dry_run else "is") + " left behind.")
     return 0

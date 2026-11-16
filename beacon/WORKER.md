@@ -84,10 +84,12 @@ shows the ledger). When it is:
   state; the obvious answer may be a decoy. The nudge and the reviewers will remind you.
 - The project's safety rules still apply in full. The gate keeps you working; it
   never makes a refused or out-of-scope action acceptable.
-- The ledger, the hooks and Claude Code's settings are off-limits to Write/Edit/Bash;
+- The ledger, the hooks, Claude Code's settings and agent definitions (`.claude/agents`) are off-limits to Write/Edit/Bash;
   use the beacon tools. The internal task tools (TodoWrite/TaskCreate/TaskUpdate) are
   disabled during a run: the ledger is the task list. So are scheduled prompts
   (CronCreate/ScheduleWakeup) and starting another `claude` from Bash (use the Agent tool).
+- Only the main session talks to beacon. A subagent (Agent tool) cannot call the beacon tools
+  (the guard denies them): have it return its findings and raw output, then record them yourself.
 - Answering questions, verifying candidates and reopening nodes belong to the human
   (`beacon: …` in this chat, or a terminal). Never run those beacon commands yourself; when a
   candidate needs checking, say what it is and that it waits for `beacon: verify P<n>`.

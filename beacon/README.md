@@ -18,7 +18,7 @@ without a virtualenv. Only the worker-facing MCP server needs the `mcp` package.
 | `ledger.py` | SQLite ledger: problems (from the checklist) → solutions (hypotheses) → approaches, evidence (de-duplicated by content hash), questions for the human, and a hash-chained event log with a state digest (tamper-evident). Enforces the rules: no deletion; `done` needs own evidence; `dead_end` needs reason **and** assumption; a problem is done only through verification. |
 | `gate.py` | The Stop decision. Reads the ledger, not the worker's prose. Escalation: nudge → lighthouse → stop with a report. Budgets (soft, hard, one near-done extension), stall/idle counters, waiting jobs, refusals routed to the human. |
 | `lighthouse.py` | Fresh-context reviewer via the Messages API (no tools, no transcript). Answers: which dead ends rest on a doubtful assumption, which approach classes are missing, which done claims are weak. Only proposes; vague or duplicate suggestions are dropped. |
-| `hooks.py` | Claude Code hook entry points: `stop`, `session-start`, `pre-tool-use` (guards the ledger, settings, internal task tools, the human's CLI commands, scheduled prompts, nested `claude`, optional no-web), `post-tool-use` (activity hash), `stop-failure` (log + notify), `user-prompt-submit` (chat commands). Each shows a one-line `beacon ▸ …` message in the chat. Fail-open. |
+| `hooks.py` | Claude Code hook entry points: `stop`, `session-start`, `pre-tool-use` (guards the ledger, settings, internal task tools, the human's CLI commands, scheduled prompts, nested `claude`, beacon's own MCP tools in a subagent, optional no-web), `post-tool-use` (activity hash), `stop-failure` (log + notify), `user-prompt-submit` (chat commands). Each shows a one-line `beacon ▸ …` message in the chat. Fail-open. |
 | `chat.py` | `beacon: …` commands typed in the Claude Code chat (`beacon: help` lists them); `#N <text>` answers question N. |
 | `board.py` | The visual graph: `<run>/graph.html`, self-contained (no CDN), statuses as colours + symbols, details per node, what waits on you, recent stops; rewritten by the hooks after each change once opened, and reloads itself while "live" is ticked. |
 | `logview.py` | `beacon log` (each stop: what Claude Code said + the exact reply beacon sent) and `beacon transcript` (Claude Code's own session log, readable), both with `--follow`. |
@@ -27,7 +27,7 @@ without a virtualenv. Only the worker-facing MCP server needs the `mcp` package.
 | `report.py` | `REPORT.md` (near-done first, then what needs you) and a mermaid/HTML graph. |
 | `decider.py` | At a branch (`ask(kind="approach_choice")`), a separate model (Opus 5.5) ranks the options from the problem's ledger, evidence, the human's answers, the worker's brief and the session's observations (tool calls + outputs; `decider_transcript=full` adds the worker's prose). Its ranking orders the nodes; its reasons go into the ledger. Falls back to the worker's order without a key / over budget / on refusal or timeout. |
 | `classify.py` | A question the worker left as prose at a stop is read by Opus (`classifier_model`) with the problem's ledger and the session's observations: a choice is made on the spot, a request to run something is approved by your standing rule, only information you alone have comes to you; when the worker looks stuck it adds a step-back note. No key / over budget = keyword heuristic. |
-| `project.py` | `beacon setup-project DIR`: merges the hooks, an allow rule for the beacon MCP tools, the MCP server entry and the worker rules into a project (backups as `*.beacon-bak`, removed again by teardown once the file is back to them, the others kept and named; never installs the hooks twice across `settings.json` / `settings.local.json`); `beacon teardown-project DIR` removes exactly that again. |
+| `project.py` | `beacon setup-project DIR`: merges the hooks, an allow rule for the beacon MCP tools, the MCP server entry and the worker rules into a project (backups as `*.beacon-bak`, removed again by teardown once the file is back to them or their content is committed in `HEAD`, the others kept and named; never installs the hooks twice across `settings.json` / `settings.local.json`); `beacon teardown-project DIR` removes exactly that again. |
 | `vmstate.py` | `vm_check` tool: fingerprints a VM through labhand (processes, listening ports, samples/ digest without labhand's `_*` files), keeps a baseline in the ledger and attaches each check as evidence, so a dead end shows whether the VM was clean. |
 | `evalkit.py` | `beacon eval`: runs a suite under `baseline` / `gate` / `gate_lh` / `gate_lh_alt` (lighthouse on another Claude model), isolated copies, web denied, success decided by the task's verify command; `results.jsonl` (resumable) + `summary.md`. |
 | `demo.py` | `beacon demo`: a toy practice run (three puzzles, `check.py`, `TESTING.md`) and `--auto`, a live smoke test of the whole cycle with the real Claude Code. |
@@ -109,6 +109,15 @@ it, and that backup is kept the same way. Every kept backup's message says what 
 it was before the run, or teardown's own copy taken before it removed beacon's parts. The older backups
 setup moved aside (`<file>.beacon-bak.old[.N]`) are settled too: one whose bytes the final file has is
 removed, every other one is kept and named; teardown's last line lists exactly the backups left behind.
+
+A backup (or `.old`) whose bytes equal the file's version in the repository's `HEAD` commit is
+redundant as well and is removed with the reason "committed in HEAD": a run that legitimately edits a
+tracked `CLAUDE.md` leaves no backup behind, since the pre-run content is in git. Teardown reads it with
+`git ls-tree` / `git cat-file` (10 s timeout, inherited `GIT_*` variables dropped) for the path git
+tracks (for a symlink, its target's path), only as a regular file in `HEAD`; the index (staged changes)
+never counts. Not a git work tree, git missing, an untracked file, no commit yet or any git error: the
+check does not apply and the rules above decide. A backup that differs from both the final file and
+`HEAD` is always kept and named, and `--dry-run` reports the same verdicts without touching anything.
 
 `setup-project` makes sure the backup is this run's pre-run state: a `<file>.beacon-bak` already there
 that differs from the (unwired) file is from an older run; it is moved aside to a free
@@ -361,7 +370,14 @@ python3 -m beacon watch --run ~/beacon-runs/fo13 --cwd ~/ctf/fo13          # run
 - **Tamper-evident, not tamper-proof.** The worker runs as your OS user. The PreToolUse
   guard blocks the obvious routes (Write/Edit into the run dir or the beacon package,
   Bash commands naming the ledger, `.claude/settings*`, `.mcp.json`); the state digest
-  catches the rest. On a failed integrity check the gate writes nothing (a new event
+  catches the rest. Only the main session talks to beacon: a subagent inherits the `mcp__beacon`
+  tools, and the guard denies every one of them when the hook input carries an `agent_id` (set only
+  for a subagent's call; a session started with an agent option has `agent_type` alone and is the
+  main session). Agent definitions are off-limits too: one can carry `permissionMode:
+  bypassPermissions` for the subagent it starts, so `setup-project` adds the deny rules
+  `Edit(**/.claude/agents/**)` and `Edit(~/.claude/agents/**)` (teardown removes them with the
+  others), and the guard refuses a Write/Edit into any `.claude/agents` directory (case-insensitive,
+  through symlinks) and a Bash command or another MCP server's call that names `.claude/agents`. On a failed integrity check the gate writes nothing (a new event
   would re-seal the tampered state) and stops with a loud report.
 - **No model calls by default (since 2026-11-15).** `max_lighthouse_calls`, `max_decider_calls`,
   `max_classifier_calls` and `max_followup_calls` default to 0: a stall stops the run for the human (or the

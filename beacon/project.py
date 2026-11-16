@@ -28,10 +28,13 @@ outside beacon's parts is kept (a file it rewrites with no backup is backed up f
 
 Backups never outlive their use and never take the only copy of anything with them: after teardown a
 backup is removed only when the final file equals it (bytes and permission bits; for a symlink, the
-target's content, the link untouched); any other backup is kept and named in teardown's output with the
-reason and what it holds (the pre-run file, or teardown's own copy of a wired file). The older backups
-setup moved aside (.beacon-bak.old[.N]) are settled the same way: removed when the final file has their
-bytes, otherwise kept and named. A .claude/beacon backup that holds a beacon wrapper (an older version
+target's content, the link untouched), or when its bytes equal the file's version in the repository's HEAD
+commit (the content is safe in git; `git cat-file` on the tracked path, for a symlink the target's path, a
+regular file in HEAD only, the index never counts; "committed in HEAD" in the output). Outside a git work
+tree, for an untracked file, or on any git error or timeout the HEAD check simply does not apply. Any other
+backup is kept and named in teardown's output with the reason and what it holds (the pre-run file, or
+teardown's own copy of a wired file). The older backups setup moved aside (.beacon-bak.old[.N]) are
+settled the same way: removed when the final file or HEAD has their bytes, otherwise kept and named. A .claude/beacon backup that holds a beacon wrapper (an older version
 backed it up) is not a copy of anything the project owns: setup and teardown remove it, and it never
 stands in for the project's file. --dry-run reports the same verdicts.
 """
@@ -40,6 +43,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 
 from .shellrun import posix_path
 
@@ -51,7 +55,9 @@ HOOK_EVENTS = (("Stop", "stop", 300), ("SessionStart", "session-start", 30),
 # depend on the hooks running: a second line of defence for the supervisor's own files.
 # (Edit rules cover every built-in file-editing tool.)
 PROTECT_DENY = ("Edit(**/ledger.db*)", "Bash(sqlite3 *)", "Edit(**/.claude/settings.json)",
-                "Edit(**/.claude/settings.local.json)", "Edit(**/.mcp.json)", "Edit(**/.claude/beacon)") + tuple(
+                "Edit(**/.claude/settings.local.json)", "Edit(**/.mcp.json)", "Edit(**/.claude/beacon)",
+                # agent definitions: one can carry `permissionMode: bypassPermissions` for the subagent it starts
+                "Edit(**/.claude/agents/**)", "Edit(~/.claude/agents/**)") + tuple(
     f"Bash(.claude/beacon {c} *)" for c in ("answer", "verify", "set-verify", "reopen", "config", "lighthouse",
                                             "init", "setup-project", "teardown-project"))
 WRAPPER = """#!/bin/sh
@@ -562,14 +568,71 @@ def _old_backups(bak):
     return [os.path.join(d, n) for _, n in sorted(found)]
 
 
+GIT_TIMEOUT = 10
+
+
+def _git(args, cwd):
+    """Run git in `cwd` with every GIT_* variable of this environment dropped (a GIT_DIR or GIT_INDEX_FILE
+    inherited from a hook would point it at another repository). -> stdout bytes, or None on any failure:
+    git missing, a timeout, a non-zero exit."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"                 # read-only: never take the index lock
+    try:
+        r = subprocess.run(["git", "--literal-pathspecs", *args], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=GIT_TIMEOUT)
+    except Exception:                               # OSError, TimeoutExpired, ...: never fail teardown on git
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _head_blob(path):
+    """The bytes of the file at `path` in its repository's HEAD commit, with the path git tracks it under:
+    (bytes, path in the repository), or None when there is none to compare with (not in a git work tree,
+    git missing or failing, no HEAD yet, the path not tracked in HEAD, or tracked as anything but a regular
+    file). A symlink is followed to its target, the file a backup copies, and the target's tracked version
+    is read in the repository that holds the target. HEAD only: the index (staged changes) never counts."""
+    try:
+        real = os.path.realpath(path)
+        cwd = os.path.dirname(real)
+        if not os.path.isdir(cwd):
+            return None
+        top = _git(["rev-parse", "--show-toplevel"], cwd)
+        if not top or not top.endswith(b"\n"):
+            return None
+        top = os.path.realpath(os.fsdecode(top[:-1]))
+        rel = os.path.relpath(real, top)
+        if rel == os.curdir or rel == os.pardir or rel.startswith(os.pardir + os.sep) or os.path.isabs(rel):
+            return None
+        rel = rel.replace(os.sep, "/")
+        out = _git(["ls-tree", "-z", "--full-tree", "HEAD", "--", rel], top)
+        if not out:
+            return None
+        entries = [e for e in out.split(b"\0") if e]
+        if len(entries) != 1:
+            return None
+        meta, _, name = entries[0].partition(b"\t")
+        parts = meta.split(b" ")
+        if (len(parts) != 3 or parts[0] not in (b"100644", b"100755") or parts[1] != b"blob"
+                or os.fsdecode(name) != rel):
+            return None
+        sha = parts[2].decode("ascii")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+            return None
+        blob = _git(["cat-file", "blob", sha], top)
+        return None if blob is None else (blob, rel)
+    except Exception:
+        return None
+
+
 def _settle_backups(project, td):
     """After teardown: a backup the file is back to (bytes and permission bits, through a symlink) is
     removed; any other backup is kept and named, with what it holds. The older backups setup moved aside
     (`.beacon-bak.old[.N]`) are settled the same way: one whose bytes the final file has is removed, every
-    other one is kept and named. -> messages.
+    other one is kept and named. A backup (or .old) whose bytes equal the file's version in HEAD is removed
+    too ("committed in HEAD", `_head_blob`): git holds that content. -> messages.
 
-    A backup is deleted only when the same bytes exist in the file it backs up, or when it holds nothing
-    but beacon's own command (`.claude/beacon` of an older version: no copy of anything the project owns).
+    A backup is deleted only when the same bytes exist in the file it backs up or in the HEAD commit, or
+    when it holds nothing but beacon's own command (`.claude/beacon` of an older version: no copy of anything the project owns).
     A backup that is not a regular file is left alone and named."""
     out = []
     for rel in WIRED:
@@ -577,6 +640,15 @@ def _settle_backups(project, td):
         bak = path + BAK
         name = rel + BAK
         final = td.state(path)
+        head = []                                   # HEAD's version, looked up once and only when needed
+
+        def in_head(data, head=head, path=path):
+            if not head:
+                head.append(_head_blob(path))
+            return head[0] is not None and head[0][0] == data
+
+        def committed(head=head):
+            return f"committed in HEAD: the same bytes as {head[0][1]} in the repository's HEAD commit"
         if path in td.made:
             have = td.made[path] if td.dry_run else _file_state(bak)
         elif os.path.lexists(bak) and (os.path.islink(bak) or not os.path.isfile(bak)):
@@ -598,6 +670,9 @@ def _settle_backups(project, td):
         elif final == have:
             _drop(bak, td, out, f"{name}: removed the backup ({rel} is back to it byte for byte)",
                   f"{name}: kept the backup: {rel} is back to it byte for byte, but removing it failed")
+        elif in_head(have[0]):
+            _drop(bak, td, out, f"{name}: removed the backup ({committed()})",
+                  f"{name}: kept the backup: it is {committed()}, but removing it failed")
         elif teardowns:
             what = f"teardown's copy of {rel} taken before it removed beacon's parts" + (
                 "" if path in td.made else " (by a teardown that did not finish)")
@@ -626,6 +701,9 @@ def _settle_backups(project, td):
             elif final is not None and final[0] == ostate[0]:
                 _drop(old, td, out, f"{oname}: removed the older backup ({rel} has the same bytes)",
                       f"{oname}: kept older backup: {rel} has the same bytes, but removing it failed")
+            elif in_head(ostate[0]):
+                _drop(old, td, out, f"{oname}: removed the older backup ({committed()})",
+                      f"{oname}: kept older backup: it is {committed()}, but removing it failed")
             else:
                 why = f"differs from {rel}" if final is not None else f"{rel} does not exist"
                 out.append(f"{oname}: kept older backup: {why} (setup moved it aside: it is from an earlier run)")
