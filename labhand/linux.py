@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""labhand.linux — Linux-host tools: a GUI program under Xvfb, scripted gdb, capa / YARA (raw output)."""
+"""labhand.linux — Linux-host tools: a GUI program under Xvfb, scripted gdb, capa / YARA / YARA-X / Volatility 3 (raw output)."""
 import re, shlex
 from . import remote, hosts
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
@@ -233,12 +233,12 @@ def linux_gdb(prog, script, args="", gui=True, screen="1280x800x24",
                       known=known if ok else [], match=flag, info=detail)
 
 
-# --- Linux: capability triage (capa, YARA) ---------------------------------------------
-# Two more thin "run a tool, return its raw output" wrappers, like linux_gdb. labhand
-# only RUNS capa / yara on the host and hands back their text untouched: no parsing, no
-# capability map, no ATT&CK / MBC reading, no verdict - that is the Brain's job. A tool
-# that is not installed on the host comes back as the raw shell error (ok=False); labhand
-# never installs anything. Every caller-supplied path / option is shlex-quoted, and an
+# --- Linux: capability triage (capa, YARA / YARA-X, Volatility 3) ----------------------
+# Thin "run a tool, return its raw output" wrappers, like linux_gdb. labhand only RUNS
+# capa / yara / yr (YARA-X) / vol (Volatility 3) on the host and hands back their text
+# untouched: no parsing, no capability map, no ATT&CK / MBC reading, no verdict - that is
+# the Brain's job. A tool that is not installed on the host comes back as the raw shell
+# error (ok=False); labhand never installs anything. Every caller-supplied path / option is shlex-quoted, and an
 # argument that starts with "-" is prefixed with "./" so it cannot be read as an option.
 
 def _q_path(p):
@@ -293,12 +293,23 @@ def linux_capa(path, host=None, timeout=120, extra=""):
     return _missing_tool_note(res, "capa", "pipx install flare-capa")
 
 
-def linux_yara(rules, target, host=None, timeout=60, extra=""):
+_YARA_ENGINES = {                    # engine -> (command prefix, tool name, install hint)
+    "yara": ("yara", "yara", "apt install yara"),
+    "yarax": ("yr scan", "yr", "cargo install yara-x-cli"),
+}
+
+
+def linux_yara(rules, target, host=None, timeout=60, extra="", engine="yara"):
     """Run `yara <rules> <target>` on a linux host (paths relative to the host workdir) and
-    return the RAW VMResult: yara's stdout/stderr unchanged. No interpretation."""
+    return the RAW VMResult: yara's stdout/stderr unchanged. No interpretation.
+    engine="yarax" runs the YARA-X CLI instead: `yr scan <extra> <rules> <target>`."""
     h, err = hosts.check(host, "linux_yara", "linux")
     if err:
         return err
+    if not isinstance(engine, str) or engine not in _YARA_ENGINES:
+        return VMResult(False, f"linux_yara: unknown engine {engine!r}; allowed: "
+                                 + ", ".join(_YARA_ENGINES))
+    prefix, tool, hint = _YARA_ENGINES[engine]
     if not str(rules or "").strip() or not str(target or "").strip():
         return VMResult(False, "linux_yara: `rules` and `target` are both required "
                                  "(a rules file and a file/dir in the host workdir)")
@@ -307,6 +318,37 @@ def linux_yara(rules, target, host=None, timeout=60, extra=""):
         opts = _q_extra(extra)
     except ValueError as e:          # e.g. an unbalanced quote in `extra`
         return VMResult(False, f"linux_yara: could not split `extra` into words ({e})")
-    cmd = "yara " + (opts + " " if opts else "") + _q_path(rules) + " " + _q_path(target)
-    res = _run_and_wrap(cmd, h.name, timeout, f"yara {str(rules)[:30]} {str(target)[:30]}")
-    return _missing_tool_note(res, "yara", "apt install yara")
+    cmd = prefix + " " + (opts + " " if opts else "") + _q_path(rules) + " " + _q_path(target)
+    res = _run_and_wrap(cmd, h.name, timeout, f"{prefix} {str(rules)[:30]} {str(target)[:30]}")
+    return _missing_tool_note(res, tool, hint)
+
+
+def linux_vol(image, plugin, host=None, timeout=300, extra="", vol_opts=""):
+    """Run Volatility 3 (`vol <vol_opts> -f <image> <plugin> <extra>`) on a linux host
+    (`image` relative to the host workdir) and return the RAW VMResult: vol's stdout/stderr
+    unchanged. No interpretation. `vol_opts` are vol's GLOBAL options (e.g. `--offline`,
+    `-r json`, `-s <symdir>`) and go before `-f`; `extra` goes after the plugin (plugin
+    options). A plugin option such as `--dump` / `-o <dir>` can write files into the workdir."""
+    h, err = hosts.check(host, "linux_vol", "linux")
+    if err:
+        return err
+    if not str(image or "").strip() or not str(plugin or "").strip():
+        return VMResult(False, "linux_vol: `image` and `plugin` are both required "
+                                 "(a memory image in the host workdir and a plugin, "
+                                 "e.g. linux.pslist.PsList)")
+    if str(plugin).startswith("-"):  # a plugin name, not an option: options go in `extra`
+        return VMResult(False, f"linux_vol: `plugin` must be a plugin name, not an option "
+                                 f"({str(plugin)[:40]!r}); pass options in `extra`")
+    timeout = _int_timeout(timeout, 300)
+    try:
+        opts = _q_extra(extra)
+    except ValueError as e:          # e.g. an unbalanced quote in `extra`
+        return VMResult(False, f"linux_vol: could not split `extra` into words ({e})")
+    try:
+        gopts = _q_extra(vol_opts)
+    except ValueError as e:          # e.g. an unbalanced quote in `vol_opts`
+        return VMResult(False, f"linux_vol: could not split `vol_opts` into words ({e})")
+    cmd = ("vol " + (gopts + " " if gopts else "") + "-f " + _q_path(image) + " "
+           + shlex.quote(str(plugin)) + (" " + opts if opts else ""))
+    res = _run_and_wrap(cmd, h.name, timeout, f"vol {str(plugin)[:30]} {str(image)[:30]}")
+    return _missing_tool_note(res, "vol", "pipx install volatility3")

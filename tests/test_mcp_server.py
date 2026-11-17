@@ -23,11 +23,11 @@ EXPECTED_TOOLS = {
     "run_cmd", "run_script", "read_file", "job_start", "job_poll",
     "win_windows", "win_screenshot", "win_gui_run", "win_frida", "win_ui_tree",
     "win_ui_click", "win_ui_type", "win_key", "win_ui_seq",
-    "linux_gui_run", "linux_gdb", "linux_capa", "linux_yara", "upload_file", "download_file",
+    "linux_gui_run", "linux_gdb", "linux_capa", "linux_yara", "linux_vol", "upload_file", "download_file",
     "vm_status", "vm_start", "vm_stop", "vm_revert", "vm_snapshot",
 }
 READ_ONLY = {"read_file", "win_windows", "win_screenshot", "win_ui_tree", "vm_status",
-             "linux_capa", "linux_yara"}
+             "linux_capa", "linux_yara", "linux_vol"}
 HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 
 # 1x1 transparent PNG
@@ -85,6 +85,48 @@ def test_command_runners_are_open_world():
     tools = _tools()
     for name in ("run_cmd", "run_script", "job_start", "win_gui_run", "linux_gui_run"):
         assert _attr(tools[name].annotations, "openWorldHint") is True
+
+
+def test_mcp_vol_registered_read_only_with_all_four_hints():
+    ann = _tools()["linux_vol"].annotations
+    assert ann.title
+    assert (_attr(ann, "readOnlyHint"), _attr(ann, "destructiveHint"),
+            _attr(ann, "idempotentHint"), _attr(ann, "openWorldHint")) == (True, False, True, False)
+
+
+def test_mcp_vol_and_yara_engine_forward_to_the_library(monkeypatch):
+    from labhand import linux
+    seen = []
+    monkeypatch.setattr(linux, "linux_vol", lambda *a, **k: seen.append(("vol", a, k))
+                        or VMResult(True, "v"))
+    monkeypatch.setattr(linux, "linux_yara", lambda *a, **k: seen.append(("yara", a, k))
+                        or VMResult(True, "y"))
+    assert mcp_server.linux_vol("mem.raw", "linux.pslist.PsList", extra="--pid 1") == "v"
+    assert mcp_server.linux_yara("r.yar", "t") == "y"
+    assert mcp_server.linux_yara("r.yar", "t", engine="yarax") == "y"
+    assert seen[0] == ("vol", ("mem.raw", "linux.pslist.PsList"),
+                       {"host": None, "timeout": 300, "extra": "--pid 1", "vol_opts": ""})
+    assert seen[1][2]["engine"] == "yara" and seen[2][2]["engine"] == "yarax"
+
+
+def test_mcp_vol_yara_engine_param_is_optional():
+    props = _attr(_tools()["linux_yara"], "inputSchema")
+    req = props.get("required", [])
+    assert "engine" in props["properties"] and "engine" not in req
+    assert set(req) == {"rules", "target"}
+    vol = _attr(_tools()["linux_vol"], "inputSchema")
+    assert set(vol.get("required", [])) == {"image", "plugin"}
+
+
+def test_mcp_vol_opts_optional_and_forwarded(monkeypatch):
+    from labhand import linux
+    vol = _attr(_tools()["linux_vol"], "inputSchema")
+    assert "vol_opts" in vol["properties"] and "vol_opts" not in vol.get("required", [])
+    seen = []
+    monkeypatch.setattr(linux, "linux_vol", lambda *a, **k: seen.append(k) or VMResult(True, "v"))
+    assert mcp_server.linux_vol("mem.raw", "linux.pslist.PsList",
+                                vol_opts="--offline -r json") == "v"
+    assert seen[0]["vol_opts"] == "--offline -r json"
 
 
 def test_job_poll_is_idempotent_and_closed_world():
