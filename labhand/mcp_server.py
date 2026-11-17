@@ -226,6 +226,23 @@ def linux_gdb(prog: str, script: str, args: str = "", gui: bool = True,
                                  max_lines=max_lines, timeout=timeout, host=host))
 
 
+# --- Linux: capability triage (raw output; the Brain interprets) ------------
+@mcp.tool(annotations=_observe("Run capa on a sample (Linux host)"))
+def linux_capa(path: str, timeout: int = 120, extra: str = "", host: str | None = None):
+    """Run the capa CLI on a linux host against `path` (relative to the host workdir) and
+    return its RAW output. labhand does not interpret it (no capability map, no verdict)
+    and does not install capa if it is missing."""
+    return _emit(linux.linux_capa(path, host=host, timeout=timeout, extra=extra))
+
+
+@mcp.tool(annotations=_observe("Run YARA rules on a target (Linux host)"))
+def linux_yara(rules: str, target: str, timeout: int = 60, extra: str = "",
+               host: str | None = None):
+    """Run `yara <rules> <target>` on a linux host (paths relative to the host workdir) and
+    return its RAW output. labhand does not interpret it and does not install yara."""
+    return _emit(linux.linux_yara(rules, target, host=host, timeout=timeout, extra=extra))
+
+
 # --- background jobs --------------------------------------------------------
 @mcp.tool(annotations=_act("Start background job on a VM"))
 def job_start(name: str, command: str | None = None, script: str | None = None,

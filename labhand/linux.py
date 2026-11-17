@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""labhand.linux — Linux-host tools: a GUI program under Xvfb, scripted gdb."""
+"""labhand.linux — Linux-host tools: a GUI program under Xvfb, scripted gdb, capa / YARA (raw output)."""
 import re, shlex
 from . import remote, hosts
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
@@ -231,3 +231,82 @@ def linux_gdb(prog, script, args="", gui=True, screen="1280x800x24",
     return VMResult(ok, f"linux_gdb on {prog}: {n} chars{note}" + ("; MATCH" if flag else ""),
                       detail=f"[linux_gdb @ {prog}]\n" + detail,
                       known=known if ok else [], match=flag, info=detail)
+
+
+# --- Linux: capability triage (capa, YARA) ---------------------------------------------
+# Two more thin "run a tool, return its raw output" wrappers, like linux_gdb. labhand
+# only RUNS capa / yara on the host and hands back their text untouched: no parsing, no
+# capability map, no ATT&CK / MBC reading, no verdict - that is the Brain's job. A tool
+# that is not installed on the host comes back as the raw shell error (ok=False); labhand
+# never installs anything. Every caller-supplied path / option is shlex-quoted, and an
+# argument that starts with "-" is prefixed with "./" so it cannot be read as an option.
+
+def _q_path(p):
+    p = str(p)
+    if p.startswith("-"):
+        p = "./" + p
+    return shlex.quote(p)
+
+
+def _q_extra(extra):
+    """`extra` (a string or a list) -> shlex-quoted words. Options are passed through as
+    options (that is what `extra` is for), but each word is quoted, so no shell syntax in
+    them (`;`, `$(..)`, backticks, redirections) ever reaches the shell."""
+    if not extra:
+        return ""
+    words = [str(a) for a in extra] if isinstance(extra, (list, tuple)) else shlex.split(str(extra))
+    return " ".join(shlex.quote(w) for w in words)
+
+
+def _int_timeout(timeout, default):
+    try:
+        t = int(timeout)
+    except (TypeError, ValueError):
+        return default
+    return t if t > 0 else default
+
+
+def _missing_tool_note(res, tool, hint):
+    """A missing tool (exit 127 / 'command not found') keeps its raw output; only the
+    summary says so, with the install hint. Nothing is installed here."""
+    if not res.ok and re.search(rf"\b{re.escape(tool)}: (command )?not found", res.detail or ""):
+        res.summary = (f"{tool} is not installed on the host (labhand does not install it; "
+                       f"e.g. `{hint}`) - " + res.summary)
+    return res
+
+
+def linux_capa(path, host=None, timeout=120, extra=""):
+    """Run `capa` on a linux host against `path` (relative to the host workdir) and return
+    the RAW VMResult: capa's stdout/stderr unchanged. No interpretation."""
+    h, err = hosts.check(host, "linux_capa", "linux")
+    if err:
+        return err
+    if not str(path or "").strip():
+        return VMResult(False, "linux_capa: `path` is empty - name the sample in the host workdir")
+    timeout = _int_timeout(timeout, 120)
+    try:
+        opts = _q_extra(extra)
+    except ValueError as e:          # e.g. an unbalanced quote in `extra`
+        return VMResult(False, f"linux_capa: could not split `extra` into words ({e})")
+    cmd = "capa " + (opts + " " if opts else "") + _q_path(path)
+    res = _run_and_wrap(cmd, h.name, timeout, f"capa {str(path)[:60]}")
+    return _missing_tool_note(res, "capa", "pipx install flare-capa")
+
+
+def linux_yara(rules, target, host=None, timeout=60, extra=""):
+    """Run `yara <rules> <target>` on a linux host (paths relative to the host workdir) and
+    return the RAW VMResult: yara's stdout/stderr unchanged. No interpretation."""
+    h, err = hosts.check(host, "linux_yara", "linux")
+    if err:
+        return err
+    if not str(rules or "").strip() or not str(target or "").strip():
+        return VMResult(False, "linux_yara: `rules` and `target` are both required "
+                                 "(a rules file and a file/dir in the host workdir)")
+    timeout = _int_timeout(timeout, 60)
+    try:
+        opts = _q_extra(extra)
+    except ValueError as e:          # e.g. an unbalanced quote in `extra`
+        return VMResult(False, f"linux_yara: could not split `extra` into words ({e})")
+    cmd = "yara " + (opts + " " if opts else "") + _q_path(rules) + " " + _q_path(target)
+    res = _run_and_wrap(cmd, h.name, timeout, f"yara {str(rules)[:30]} {str(target)[:30]}")
+    return _missing_tool_note(res, "yara", "apt install yara")
