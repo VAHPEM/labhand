@@ -61,7 +61,7 @@ CHOICE_RULE = ("effectiveness first, then cost: take the option most likely to r
                "chances, take the cheaper one")
 HUMAN_PICK = 100      # priority of a node the human picked (`beacon: pick`): it goes before everything
 DECIDER_TOP = 60      # the decider's first choice; its ranking counts down from here (below a human pick)
-ACTORS = ("worker", "lighthouse", "human", "gate", "verifier", "checklist", "decider", "orchestrator")
+ACTORS = ("worker", "lighthouse", "human", "gate", "verifier", "checklist", "decider", "orchestrator", "watchdog")
 # Who may act as the human: the human, or an orchestrator the human delegated to (ccbridge, driving runs
 # from a Claude session in the Claude app). Recorded under its own actor so the hash chain tells them apart.
 HUMAN_ACTORS = ("human", "orchestrator")
@@ -1240,6 +1240,11 @@ class Ledger:
             return entry
 
         return self._mutate(actor, "flag", apply)
+
+    def record_watch_end(self, why, detail="", actor="watchdog"):
+        """`beacon watch` stopped: why (e.g. "usage_limit") and the detail, as an event in the ledger."""
+        return self._mutate(actor, "watch_end", lambda cur, seq: {"why": _clip(why, 100),
+                                                                   "detail": _clip(detail, 1200)})
 
     def save_gate(self, gate, decision, actor="gate"):
         def apply(cur, seq):

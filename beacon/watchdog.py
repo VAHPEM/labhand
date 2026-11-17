@@ -34,6 +34,7 @@ import signal
 import subprocess
 import threading
 import time
+import zoneinfo
 from dataclasses import asdict, dataclass, field
 
 from .ledger import Ledger
@@ -56,6 +57,12 @@ def hooks_disabled(notices):
     return next((n for n in notices or [] if _HOOKS_OFF.search(n)), None)
 
 
+# A usage limit whose reset is further away than this ends the run (why "usage_limit") instead of sleeping
+# for days; so does a limit without an announced reset that has lasted this long.
+USAGE_LIMIT_MAX_WAIT_S = 6 * 3600.0
+# Long waits sleep in chunks and re-read the clock: a Mac asleep during the wait does not stretch it.
+WAIT_CHUNK_S = 300.0
+
 GATE_FINAL = {"no_open_problems", "awaiting_human", "hard_budget", "soft_budget", "lighthouse_dry",
               "lighthouse_exhausted", "possible_refusal", "integrity"}
 
@@ -72,7 +79,9 @@ _TEXT_KIND = [
     (re.compile(r"no space left|disk (is )?full|ENOSPC|EDQUOT|quota exceeded", re.I), "disk"),
     (re.compile(r"unknown option|error: option|invalid (value|choice) for|unrecognized argument|failed to parse "
                 r"(settings|config|\.mcp\.json)|could not start|bubblewrap is required", re.I), "config"),
-    (re.compile(r"rate.?limit|usage limit|limit reached|\b429\b", re.I), "rate_limit"),
+    # "You've hit your 5-hour limit · resets 12pm (Asia/Saigon)" (Claude Code, measured 2026-11-16)
+    (re.compile(r"rate.?limit|usage limit|limit reached|\b429\b|hit (?:your|the) [\w\s-]{0,30}?limit", re.I),
+     "rate_limit"),
     (re.compile(r"overloaded|\b529\b", re.I), "overloaded"),
     (re.compile(r"credit balance|billing", re.I), "billing"),
     (re.compile(r"invalid api key|authenticat|unauthori[sz]ed|\b401\b|\b403\b|/login|oauth|auth login|"
@@ -92,34 +101,87 @@ class SessionResult:
     num_turns: int = 0
     text: str = ""
     reset_at: float = 0.0         # epoch seconds of an announced rate-limit reset, 0 if none
+    reset_text: str = ""          # the reset as the message wrote it ("resets 12pm (Asia/Saigon)"), "" if none
     api_retries: int = 0
     notices: list = field(default_factory=list)   # system/informational messages from Claude Code
     credential_expires_at: float = 0.0            # epoch seconds, 0 if Claude Code did not say
 
 
-def parse_reset(text, now=None):
-    """Best effort: 'resets 3am', 'reset at 15:30', 'resets in 2h 15m' -> epoch seconds."""
+# A rate limit makes the watch wait until the announced reset plus this margin.
+RATE_LIMIT_MARGIN_S = 60.0
+# A time-of-day reset that passed less than this long ago is taken as just passed (clock skew between this
+# Mac and the API), not as the same time tomorrow: the watch then retries after a short backoff.
+RESET_SKEW_S = 600.0
+_MONTHS = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+                                       "nov", "dec"), 1)}
+_RESET_HEAD = r"reset\w*\s+(?:at\s+|on\s+)?"
+_RESET_DATE = (r"(?:(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+"
+               r"(?:at\s+)?)?")
+_RESET_TZ = r"(?:\s*\(\s*([A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+)*)\s*\))?"
+_RESET_12H = re.compile(_RESET_HEAD + _RESET_DATE + r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b" + _RESET_TZ, re.I)
+_RESET_24H = re.compile(_RESET_HEAD + _RESET_DATE + r"(\d{1,2}):(\d{2})\b()(?!\s*[ap]m)" + _RESET_TZ, re.I)
+_RESET_IN = re.compile(r"reset\w*\s+in\s+(?:(\d+)\s*h\w*)?\s*(?:(\d+)\s*m\w*)?", re.I)
+
+
+def _zone(name):
+    if not name:
+        return None
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        return None             # not an IANA name: the Mac's own time zone
+
+
+def _wall(tz, day, hour, minute):
+    """Epoch seconds of the wall-clock time `day` hour:minute in `tz` (None = this Mac's zone). DST: a time in
+    the spring-forward gap or the autumn overlap resolves with fold=0 (the earlier offset)."""
+    return datetime.datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz).timestamp()
+
+
+def reset_info(text, now=None):
+    """-> (epoch seconds, the reset text as written) for the reset a limit message announces, else (0.0, "").
+
+    Understands 'resets in 2h 15m', 'resets 3am', 'reset at 15:30', 'resets 12pm (Asia/Saigon)',
+    'resets 3:30am (Europe/Paris)', 'resets Nov 18, 9am (Europe/Paris)'. A time zone in parentheses is used
+    when it is an IANA name, else this Mac's zone. Without a date it is the next such time in that zone
+    (a time that passed less than RESET_SKEW_S ago counts as just passed and is returned as it is); with a
+    date, this year's or, once that has passed, next year's."""
     now = time.time() if now is None else now
     t = text or ""
-    m = re.search(r"reset\w*\s+in\s+(?:(\d+)\s*h\w*)?\s*(?:(\d+)\s*m\w*)?", t, re.I)
+    m = _RESET_IN.search(t)
     if m and (m.group(1) or m.group(2)):
-        return now + 3600 * int(m.group(1) or 0) + 60 * int(m.group(2) or 0)
-    m = (re.search(r"reset\w*\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", t, re.I)
-         or re.search(r"reset\w*\s+(?:at\s+)?(\d{1,2}):(\d{2})\b()", t, re.I))
+        return now + 3600 * int(m.group(1) or 0) + 60 * int(m.group(2) or 0), m.group(0).strip()
+    m = _RESET_12H.search(t) or _RESET_24H.search(t)
     if not m:
-        return 0.0
-    hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower()
+        return 0.0, ""
+    mon, mday, hour, minute, ampm, tzname = m.groups()
+    hour, minute, ampm = int(hour), int(minute or 0), (ampm or "").lower()
     if ampm:
         if not 1 <= hour <= 12:
-            return 0.0
+            return 0.0, ""
         hour = hour % 12 + (12 if ampm == "pm" else 0)
     if hour > 23 or minute > 59:
-        return 0.0
-    local = datetime.datetime.fromtimestamp(now)
-    target = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target.timestamp() <= now:
-        target += datetime.timedelta(days=1)
-    return target.timestamp()
+        return 0.0, ""
+    tz = _zone(tzname)
+    today = datetime.datetime.fromtimestamp(now, tz).date()
+    try:
+        if mon:
+            target = _wall(tz, today.replace(month=_MONTHS[mon.lower()[:3]], day=int(mday)), hour, minute)
+            if target <= now - RESET_SKEW_S:
+                target = _wall(tz, today.replace(year=today.year + 1, month=_MONTHS[mon.lower()[:3]],
+                                                 day=int(mday)), hour, minute)
+        else:
+            target = _wall(tz, today, hour, minute)
+            if target <= now - RESET_SKEW_S:
+                target = _wall(tz, today + datetime.timedelta(days=1), hour, minute)
+    except ValueError:                    # Feb 30, Feb 29 in a common year
+        return 0.0, ""
+    return target, m.group(0).strip()
+
+
+def parse_reset(text, now=None):
+    """Best effort: the announced reset as epoch seconds, 0.0 if none (see reset_info)."""
+    return reset_info(text, now)[0]
 
 
 def _epoch(value):
@@ -137,8 +199,31 @@ def _epoch(value):
         return 0.0
 
 
-def classify_end(result, retry_errors, exit_code, stderr_tail="", timed_out=False, now=None):
-    """Turn what a session left behind into a SessionResult.error_kind."""
+def _result_api_kind(result):
+    """The error kind a result event states itself (Claude Code >= 2.1.3xx: api_error_status / api_error_type /
+    api_error, measured 2026-11-16 on a usage-limit session), else ""."""
+    try:
+        status = int(result.get("api_error_status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    typ = str(result.get("api_error_type") or "")
+    err = str(result.get("api_error") or "")
+    if status == 429 or typ == "rate_limit_error" or err in ("usage_limit_reached", "rate_limit"):
+        return "rate_limit"
+    if status == 529 or typ == "overloaded_error":
+        return "overloaded"
+    if status == 401 or typ == "authentication_error":
+        return "auth"
+    if typ == "billing_error":
+        return "billing"
+    if status >= 500:
+        return "server_error"
+    return ""
+
+
+def classify_end(result, retry_errors, exit_code, stderr_tail="", timed_out=False, now=None, stream_errors=()):
+    """Turn what a session left behind into a SessionResult.error_kind. stream_errors: the `error` field of
+    the stream's API-error messages ("rate_limit", ...), oldest first."""
     if timed_out:
         return "timeout"
     text = ((result or {}).get("result") or "") + "\n" + (stderr_tail or "")
@@ -148,6 +233,11 @@ def classify_end(result, retry_errors, exit_code, stderr_tail="", timed_out=Fals
         return "max_turns"
     if result is None and exit_code in (143, -15, 130, -2):
         return "terminated"
+    stated = _result_api_kind(result) if result is not None else ""
+    if stated:
+        return stated
+    if stream_errors:
+        return _API_CATEGORY.get(stream_errors[-1], "server_error")
     if retry_errors:
         return _API_CATEGORY.get(retry_errors[-1], "server_error")
     for rx, kind in _TEXT_KIND:
@@ -163,7 +253,7 @@ def backoff(kind, attempt, reset_at=0.0, now=None):
     attempt = max(1, attempt)
     if kind == "rate_limit":
         if reset_at and reset_at > now:
-            return reset_at - now + 60          # a minute of slack after the announced reset
+            return reset_at - now + RATE_LIMIT_MARGIN_S     # a minute of slack after the announced reset
         return min(3600.0, 300.0 * 2 ** (attempt - 1))
     if kind in ("overloaded", "server_error"):
         return min(900.0, 30.0 * 2 ** (attempt - 1))
@@ -214,28 +304,13 @@ class CliRunner:
         else:  # an unsupervised (baseline) session must not inherit a run from our environment
             env.pop("BEACON_RUN", None)
             env.pop("BEACON_WATCHDOG", None)
-        found = {"session_id": "", "result": None, "retries": [], "notices": [], "expires": None}
+        found = _new_found()
 
         def reader(stream, log):
             for line in stream:
                 log.write(line)
                 log.flush()
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(ev, dict):
-                    continue
-                if ev.get("session_id"):
-                    found["session_id"] = ev["session_id"]
-                if ev.get("type") == "system" and ev.get("subtype") == "api_retry":
-                    found["retries"].append(str(ev.get("error") or "unknown"))
-                elif ev.get("type") == "system" and ev.get("subtype") == "informational":
-                    found["notices"].append(str(ev.get("content") or "")[:800])
-                elif ev.get("type") == "result":
-                    found["result"] = ev
-                    if ev.get("credential_expires_at"):
-                        found["expires"] = ev["credential_expires_at"]
+                _absorb(found, line)
 
         timed_out = False
         with open(stem + ".jsonl", "w", encoding="utf-8") as log, \
@@ -259,19 +334,7 @@ class CliRunner:
                 stderr_tail = fh.read()[-2000:]
         except OSError:
             stderr_tail = ""
-        res = found["result"]
-        kind = "" if gate_ended else classify_end(res, found["retries"], code, stderr_tail, timed_out)
-        if gate_ended:
-            found["notices"].append(f"beacon: the Stop gate had let this session stop; it was still running "
-                                    f"{self.end_grace_s:.0f} s later (background work), so beacon ended it")
-        text = (res or {}).get("result") or stderr_tail
-        return SessionResult(
-            session_id=found["session_id"] or (res or {}).get("session_id", ""), exit_code=code if code is not None else -1,
-            is_error=bool((res or {}).get("is_error")) or kind != "", error_kind=kind,
-            subtype=(res or {}).get("subtype", ""), cost_usd=float((res or {}).get("total_cost_usd") or 0.0),
-            num_turns=int((res or {}).get("num_turns") or 0), text=str(text)[-2000:],
-            reset_at=parse_reset(text) if kind == "rate_limit" else 0.0, api_retries=len(found["retries"]),
-            notices=found["notices"][:20], credential_expires_at=_epoch(found["expires"]))
+        return _session_result(found, code, stderr_tail, timed_out, gate_ended, self.end_grace_s)
 
     def _wait(self, found):
         """Wait for the session; -> (timed_out, gate_ended). Stops it on timeout_s (if set), or END_GRACE_S after
@@ -325,6 +388,86 @@ class CliRunner:
         p.wait()
 
 
+def _new_found():
+    return {"session_id": "", "result": None, "retries": [], "notices": [], "expires": None, "errors": [],
+            "resets_at": 0.0}
+
+
+def _limit_reset(info):
+    """resetsAt of a rejected rate_limit_info (epoch seconds or ms), else 0."""
+    if not isinstance(info, dict) or info.get("status") != "rejected":
+        return 0.0
+    try:
+        v = float(info.get("resetsAt") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return v / 1000.0 if v > 1e12 else v
+
+
+def _absorb(found, line):
+    """Take what matters from one stream-json line into `found`."""
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(ev, dict):
+        return
+    if ev.get("session_id"):
+        found["session_id"] = ev["session_id"]
+    typ = ev.get("type")
+    if typ == "system" and ev.get("subtype") == "api_retry":
+        found["retries"].append(str(ev.get("error") or "unknown"))
+    elif typ == "system" and ev.get("subtype") == "informational":
+        found["notices"].append(str(ev.get("content") or "")[:800])
+    elif typ == "rate_limit_event":
+        found["resets_at"] = _limit_reset(ev.get("rate_limit_info")) or found["resets_at"]
+    elif typ == "assistant" and ev.get("error") and (ev.get("is_api_error_message") or ev.get("api_error")):
+        found["errors"].append(str(ev["error"]))
+        params = ev.get("api_error_params")
+        if isinstance(params, dict):
+            found["resets_at"] = _limit_reset(params.get("rate_limit_info")) or found["resets_at"]
+    elif typ == "result":
+        found["result"] = ev
+        if ev.get("credential_expires_at"):
+            found["expires"] = ev["credential_expires_at"]
+
+
+def _session_result(found, code, stderr_tail="", timed_out=False, gate_ended=False, end_grace_s=0.0, now=None):
+    res = found["result"]
+    kind = "" if gate_ended else classify_end(res, found["retries"], code, stderr_tail, timed_out,
+                                              stream_errors=found["errors"])
+    if gate_ended:
+        found["notices"].append(f"beacon: the Stop gate had let this session stop; it was still running "
+                                f"{end_grace_s:.0f} s later (background work), so beacon ended it")
+    text = (res or {}).get("result") or stderr_tail
+    reset_at, reset_text = 0.0, ""
+    if kind == "rate_limit":
+        # the stream's resetsAt is exact; the text ("resets 12pm (Asia/Saigon)") is the fallback
+        reset_at, reset_text = reset_info(text, now)
+        reset_at = found["resets_at"] or reset_at
+    return SessionResult(
+        session_id=found["session_id"] or (res or {}).get("session_id", ""), exit_code=code if code is not None else -1,
+        is_error=bool((res or {}).get("is_error")) or kind != "", error_kind=kind,
+        subtype=(res or {}).get("subtype", ""), cost_usd=float((res or {}).get("total_cost_usd") or 0.0),
+        num_turns=int((res or {}).get("num_turns") or 0), text=str(text)[-2000:],
+        reset_at=reset_at, reset_text=reset_text, api_retries=len(found["retries"]),
+        notices=found["notices"][:20], credential_expires_at=_epoch(found["expires"]))
+
+
+def read_session_log(path, exit_code=0, now=None):
+    """Classify a saved session (sessions/<stem>.jsonl, the .stderr beside it if present) as the runner would."""
+    found = _new_found()
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            _absorb(found, line)
+    try:
+        with open(os.path.splitext(path)[0] + ".stderr", encoding="utf-8", errors="replace") as fh:
+            stderr_tail = fh.read()[-2000:]
+    except OSError:
+        stderr_tail = ""
+    return _session_result(found, exit_code, stderr_tail, now=now)
+
+
 def _new_allow(path, offset, session_id):
     """Read decisions.jsonl from `offset`: -> (new offset, did the gate let `session_id` stop?)."""
     try:
@@ -353,13 +496,19 @@ def _last_gate(L, since_seq):
 def watch(run, runner, *, max_sessions=20, max_hours=None, max_cost_usd=None, max_transient=12,
           max_wait_s=None, clock=time.time, sleep=time.sleep, log=print):
     """Returns {"why", "sessions", "cost_usd", "detail"}. No time or cost limit by default (the human's choice):
-    max_hours / max_cost_usd / max_wait_s = None means none; a rate-limit wait lasts until the announced reset."""
+    max_hours / max_cost_usd / max_wait_s = None means none; a rate-limit wait lasts until the announced reset.
+
+    A rate-limited session (usage limit) is a pause, not a failure: the watch waits until the announced reset
+    plus RATE_LIMIT_MARGIN_S (no announced reset: a backoff capped at 1 h) and resumes. It does not count
+    toward max_transient (too_many_failures), the crash backoff or max_sessions. A reset more than
+    USAGE_LIMIT_MAX_WAIT_S away, or a limit without a reset lasting that long, ends the run as "usage_limit"."""
     from .gate import Decision
     from .hooks import _notify
     from .report import write_report
 
     L = Ledger.open(run)
     started, sessions, transient, no_gate = clock(), 0, 0, 0
+    limited_total, limited_streak, limited_since = 0, 0, None
     warned = {}
     costs, resume = {}, None
 
@@ -371,6 +520,19 @@ def watch(run, runner, *, max_sessions=20, max_hours=None, max_cost_usd=None, ma
         except OSError:
             pass
 
+    def sleep_until(until):
+        """Sleep until clock() reaches `until`, in chunks; a run whose problems all closed meanwhile wakes."""
+        planned, slept = until - clock(), 0.0
+        while slept < planned:
+            left = min(planned - slept, until - clock())
+            if left <= 0:
+                return
+            step = min(left, WAIT_CHUNK_S)
+            sleep(step)
+            slept += step
+            if slept < planned and not L.open_problems():
+                return
+
     def end(why, detail=""):
         integrity = L.verify_integrity()
         path = write_report(L, Decision("allow", f"watchdog:{why}", report=detail), integrity)
@@ -378,6 +540,11 @@ def watch(run, runner, *, max_sessions=20, max_hours=None, max_cost_usd=None, ma
             _notify(L, f"watch:{why}", path)
         out = {"why": why, "sessions": sessions, "cost_usd": round(sum(costs.values()), 4), "detail": detail}
         jlog({"event": "end", **out})
+        if integrity[0]:
+            try:
+                L.record_watch_end(why, detail)
+            except Exception as e:  # noqa: BLE001 - the report is written; the run still ends
+                log(f"[beacon watch] could not record the end in the ledger: {e}")
         log(f"[beacon watch] stopped: {why} after {sessions} session(s). Report: {path}")
         L.close()
         return out
@@ -385,6 +552,7 @@ def watch(run, runner, *, max_sessions=20, max_hours=None, max_cost_usd=None, ma
     if not os.environ.get("ANTHROPIC_API_KEY"):
         log("[beacon watch] note: no ANTHROPIC_API_KEY in the environment; the worker uses the Claude Code "
             "login, i.e. your subscription limits.")
+    prev_term = _term_as_interrupt()
     try:
         while True:
             ok, why = L.verify_integrity()
@@ -392,7 +560,7 @@ def watch(run, runner, *, max_sessions=20, max_hours=None, max_cost_usd=None, ma
                 return end("integrity", why)
             if not L.open_problems():
                 return end("no_open_problems")
-            if sessions >= max_sessions:
+            if sessions - limited_total >= max_sessions:
                 return end("max_sessions")
             if max_hours and clock() - started > max_hours * 3600:
                 return end("max_hours")
@@ -406,6 +574,8 @@ def watch(run, runner, *, max_sessions=20, max_hours=None, max_cost_usd=None, ma
                 costs[res.session_id] = max(costs.get(res.session_id, 0.0), res.cost_usd)
             gate = _last_gate(L, seq0)
             jlog({"event": "session", "n": sessions, "resume": resume, "result": asdict(res), "gate": gate})
+            if res.error_kind != "rate_limit":
+                limited_streak, limited_since = 0, None
             exp = getattr(res, "credential_expires_at", 0.0) or 0.0
             if exp and exp - clock() < 3 * 86400 and not warned.get("expiry"):
                 warned["expiry"] = True
@@ -427,6 +597,36 @@ def watch(run, runner, *, max_sessions=20, max_hours=None, max_cost_usd=None, ma
                     resume = None
                     continue
                 return end(f"gate_{gate.get('why')}")
+            if res.error_kind == "rate_limit":
+                limited_total += 1
+                limited_streak += 1
+                now = clock()
+                limited_since = now if limited_since is None else limited_since
+                reset_at, reset_text = float(res.reset_at or 0.0), getattr(res, "reset_text", "") or ""
+                if reset_at - now > USAGE_LIMIT_MAX_WAIT_S:
+                    return end("usage_limit", f"Usage limit reached; it resets at {_stamp(reset_at)}"
+                                              + (f" (\"{reset_text}\")" if reset_text else "")
+                                              + f", {(reset_at - now) / 3600:.1f} h from now: more than "
+                                              f"{USAGE_LIMIT_MAX_WAIT_S / 3600:.0f} h, so the run stops instead "
+                                              "of waiting. Start `beacon watch` again after the reset.")
+                wait = backoff("rate_limit", limited_streak, reset_at, now)
+                until = now + wait
+                if reset_at <= now and until - limited_since > USAGE_LIMIT_MAX_WAIT_S:
+                    return end("usage_limit", f"Usage limit reached and no reset time announced (or it has "
+                                              f"passed); rate-limited for {(now - limited_since) / 3600:.1f} h "
+                                              f"over {limited_streak} session(s), the next try would pass "
+                                              f"{USAGE_LIMIT_MAX_WAIT_S / 3600:.0f} h, so the run stops. Last "
+                                              f"message: {res.text[-300:]}")
+                if max_wait_s and wait > max_wait_s:
+                    return end("wait_too_long", f"rate_limit: next attempt in {wait / 3600:.1f} h"
+                                                + (f" ({reset_text})" if reset_text else ""))
+                log(f"[beacon watch] rate_limit: waiting {wait:.0f} s, until {_stamp(until)}"
+                    + (f" ({reset_text})" if reset_text else ""))
+                jlog({"event": "wait", "kind": "rate_limit", "seconds": round(wait, 1), "until": int(until + 0.999),
+                      "reset": reset_text})
+                sleep_until(until)
+                resume = res.session_id or None
+                continue
             if res.error_kind in TRANSIENT:
                 transient += 1
                 if transient > max_transient:
@@ -451,3 +651,29 @@ def watch(run, runner, *, max_sessions=20, max_hours=None, max_cost_usd=None, ma
         if stop:
             stop()
         return end("interrupted")
+    finally:
+        if prev_term is not None:
+            signal.signal(signal.SIGTERM, prev_term)
+
+
+def _stamp(epoch):
+    """Epoch seconds as this Mac's local time, for people."""
+    try:
+        return datetime.datetime.fromtimestamp(epoch).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except (OverflowError, ValueError, OSError):
+        return f"epoch {epoch:.0f}"
+
+
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def _term_as_interrupt():
+    """A SIGTERM (a run stopped from outside, e.g. while it waits for a reset) ends the watch like Ctrl-C:
+    with a report saying "interrupted". -> the previous handler, None if not installed (not the main thread)."""
+    if threading.current_thread() is not threading.main_thread():
+        return None
+    try:
+        return signal.signal(signal.SIGTERM, _raise_interrupt)
+    except (ValueError, OSError):
+        return None

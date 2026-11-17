@@ -322,7 +322,7 @@ python3 -m beacon watch --run ~/beacon-runs/fo13 --cwd ~/ctf/fo13          # run
 
 - **No time or cost limit by default.** The run ends when the gate lets it (no open work, budget of forced
   continuations, waiting on you, ...), on a fatal error, or after `--max-sessions` (20) sessions. A
-  rate-limit wait lasts until the reset Claude Code announces, however long. Each limit is still there if
+  rate-limit wait lasts until the reset Claude Code announces, up to 6 h (see "Usage limits" below). Each limit is still there if
   you want one: `--max-hours`, `--max-cost-usd`, `--session-budget-usd`, `--session-timeout-min`,
   `--max-wait-hours`. Ctrl-C stops the run cleanly (the session tree is killed, the report written).
   (`beacon eval` keeps per-run caps: equal budgets are part of comparing configurations.)
@@ -347,6 +347,33 @@ python3 -m beacon watch --run ~/beacon-runs/fo13 --cwd ~/ctf/fo13          # run
   hooks OFF ("Hooks not running: …") and denies every tool call a PreToolUse hook would have
   checked. The supervisor is then absent; the watchdog recognises Claude Code's notice and
   stops with `hooks_disabled` instead of looping. Normal network + a real login: not an issue.
+
+### Usage limits: a wait, not a crash
+
+When the subscription's limit is used up, Claude Code ends every session at once with a message like
+`You've hit your 5-hour limit · resets 12pm (Asia/Saigon)` (`subtype: success`, `is_error: true`, cost $0;
+measured 2026-11-16). The watchdog treats that as a pause:
+
+- **Recognised** from the stream's own fields (the result's `api_error_status: 429` /
+  `api_error_type: rate_limit_error`, the assistant message's `error: "rate_limit"`) and from the wording
+  (`hit your … limit`, `usage limit`, `rate limit`, `limit reached`, `429`).
+- **The reset** comes from the stream's `rate_limit_event.resetsAt` (exact) or else from the text:
+  `resets 12pm (Asia/Saigon)`, `resets 3:30am (Europe/Paris)`, `resets Nov 18, 9am (Europe/Paris)`,
+  `reset at 15:30`, `resets in 2h 15m`. A time in parentheses is read in that IANA time zone (otherwise
+  this Mac's), DST included; without a date it is the next such time there. A time that passed less than
+  10 minutes ago counts as just passed (clock skew), not as tomorrow.
+- **The wait** lasts until the reset + 60 s, then the same session is resumed. Without a usable reset
+  time: 5, 10, 20, 40 min, then hourly. `watch.jsonl` gets
+  `{"event": "wait", "kind": "rate_limit", "seconds": …, "until": <epoch seconds>, "reset": "resets 12pm (Asia/Saigon)"}`
+  (`reset` is `""` when nothing was announced). The wait sleeps in 5-minute steps against the clock, so a
+  Mac that slept meanwhile does not stretch it, and it ends early if the run has no open problem left.
+- **Not a failure.** A rate-limited session counts toward neither `too_many_failures` (`max_transient`),
+  the crash backoff, nor `--max-sessions`.
+- **Too far away.** A reset more than 6 h away (a weekly limit), or a limit without a reset time that
+  has lasted 6 h, ends the run with `usage_limit`: `REPORT.md` ("Stopped because: watchdog:usage_limit")
+  and a `watch_end` event in the ledger give the reset time and text. Start `beacon watch` again after it.
+  `--max-wait-hours` still ends the run earlier (`wait_too_long`) if you set it.
+- Ctrl-C or a SIGTERM during the wait ends the run as `interrupted`, with the report written.
 
 ## Design notes and limits (read these)
 

@@ -64,7 +64,7 @@ def test_rate_limit_waits_for_reset_then_resumes(make_run):
     out, r, sleeps = run_watch(L, [failing("rate_limit", reset_at=now + 1800), allow("awaiting_human")],
                                clock=lambda: now)
     assert out["why"] == "gate_awaiting_human"
-    assert sleeps == [1860.0]
+    assert sum(sleeps) == 1860.0 and max(sleeps) <= 300.0      # until the reset + 60 s, in chunks
     assert r.calls[0] == (FRESH_PROMPT, None) and r.calls[1] == (RESUME_PROMPT, "s1")
 
 
@@ -107,8 +107,8 @@ def test_cost_counts_resumed_totals_once(make_run):
 
 def test_wait_too_long(make_run):
     L = make_run()
-    out, _, sleeps = run_watch(L, [failing("rate_limit", reset_at=1_000_000.0 + 10 * 3600)],
-                               max_wait_s=6 * 3600)
+    out, _, sleeps = run_watch(L, [failing("rate_limit", reset_at=1_000_000.0 + 5 * 3600)],
+                               max_wait_s=4 * 3600)
     assert out["why"] == "wait_too_long" and not sleeps
 
 
@@ -251,18 +251,21 @@ def test_hooks_disabled_notice_stops_with_a_precise_reason(make_run):
 
 
 def test_no_time_or_cost_limit_by_default(make_run):
-    """By default watch has no hour, cost or wait limit: a long run, an expensive one and a long rate-limit wait
-    all go on until the gate decides."""
+    """By default watch has no hour, cost or wait limit: a long run, an expensive one and a rate-limit wait of
+    nearly 6 h all go on until the gate decides (a reset further away ends the run: test_beacon_ratelimit_wait_*)."""
     L = make_run()
     t = [1_000_000.0]
 
     def clock():
         t[0] += 24 * 3600          # every look at the clock: a day later
         return t[0]
-    steps = [failing("overloaded", cost=500.0), failing("rate_limit", reset_at=10 ** 12), allow("no_open_problems")]
+    steps = [failing("overloaded", cost=500.0), block_then_clean(), allow("no_open_problems")]
     out, r, sleeps = run_watch(L, steps, clock=clock)
     assert out["why"] == "gate_no_open_problems" and len(r.calls) == 3
-    assert any(s > 6 * 3600 for s in sleeps)            # waited for the announced reset, however long
+    now = 1_000_000.0
+    out, r, sleeps = run_watch(L, [failing("rate_limit", reset_at=now + 5.9 * 3600), allow("no_open_problems")],
+                               clock=lambda: now)
+    assert out["why"] == "gate_no_open_problems" and sum(sleeps) == 5.9 * 3600 + 60
 
 
 def test_cli_watch_defaults_set_no_limit():
