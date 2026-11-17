@@ -110,6 +110,8 @@ connection. Every `win_*` / `linux_*` call below also takes `host=None`.
 |---|---|
 | `linux_gui_run(command, wait=5, screen="1280x800x24", timeout=60)` | run a GUI program on Kali under **Xvfb** and return a screenshot. |
 | `linux_gdb(prog, script, args="", gui=True, screen="1280x800x24", max_lines=800, timeout=120)` | run a **gdb-python** script against an ELF (ASLR off, PIE base fixed at `0x555555554000`); returns whatever it `log()`s. Helpers injected: `rd/wr/u64/u32/f64/reg/cstr/at/hook/starti/cont/run`. |
+| `linux_capa(path, host=None, timeout=120, extra="")` | run **capa** on a linux host against `path` (in the host workdir); returns capa's **raw** output. labhand only runs it — the analyst/Brain reads the MITRE ATT&CK / MBC mapping. Not installed → raw `ok=False`; labhand never installs. |
+| `linux_yara(rules, target, host=None, timeout=60, extra="")` | run **yara** (`rules` against `target`) on a linux host; **raw** output, no interpretation. Not installed → raw `ok=False`. |
 
 ### UTM power & disposable sessions — `labhand.utm` (runs `utmctl` on the Mac, not over SSH)
 Needs `<NAME>_UTM_VM` in the inventory. Refuses to stop a host with a RUNNING job.
@@ -142,7 +144,7 @@ LABHAND_ENV=... LABHAND_SSH_KEY=... labhand-mcp      # stdio; = python -m labhan
 ```
 Each tool above is published as an MCP tool; screenshots come back as image content.
 Every tool declares all four MCP hints (readOnly / destructive / idempotent /
-openWorld): `read_file`, `win_windows`, `win_screenshot`, `win_ui_tree`, `vm_status` are read-only;
+openWorld): `read_file`, `win_windows`, `win_screenshot`, `win_ui_tree`, `vm_status`, `linux_capa`, `linux_yara` are read-only;
 everything else is destructive. Keep this when adding a tool (`tests/` enforces it).
 The server registers as `labhand`. See `labhand/mcp_server.py`.
 
