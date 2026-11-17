@@ -237,10 +237,23 @@ def linux_capa(path: str, timeout: int = 120, extra: str = "", host: str | None 
 
 @mcp.tool(annotations=_observe("Run YARA rules on a target (Linux host)"))
 def linux_yara(rules: str, target: str, timeout: int = 60, extra: str = "",
-               host: str | None = None):
+               host: str | None = None, engine: str = "yara"):
     """Run `yara <rules> <target>` on a linux host (paths relative to the host workdir) and
-    return its RAW output. labhand does not interpret it and does not install yara."""
-    return _emit(linux.linux_yara(rules, target, host=host, timeout=timeout, extra=extra))
+    return its RAW output. engine="yarax" runs the YARA-X CLI (`yr scan`) instead.
+    labhand does not interpret it and does not install yara / yr."""
+    return _emit(linux.linux_yara(rules, target, host=host, timeout=timeout, extra=extra,
+                                  engine=engine))
+
+
+@mcp.tool(annotations=_observe("Run a Volatility 3 plugin on a memory image (Linux host)"))
+def linux_vol(image: str, plugin: str, timeout: int = 300, extra: str = "",
+              host: str | None = None, vol_opts: str = ""):
+    """Run Volatility 3 (`vol <vol_opts> -f <image> <plugin> <extra>`) on a linux host
+    (`image` relative to the host workdir) and return its RAW output. `vol_opts` are vol's
+    global options (e.g. `--offline -r json`), placed before `-f`; `extra` are plugin
+    options. labhand does not interpret it and does not install Volatility 3 if missing."""
+    return _emit(linux.linux_vol(image, plugin, host=host, timeout=timeout, extra=extra,
+                                 vol_opts=vol_opts))
 
 
 # --- background jobs --------------------------------------------------------
