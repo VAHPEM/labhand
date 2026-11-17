@@ -17,9 +17,12 @@ FAIL-OPEN: any exception inside a hook is logged to <run>/hook-errors.log and th
 hook exits 0 with no output, i.e. the stop is allowed / the tool runs. A broken
 supervisor must never turn into an infinite, money-burning loop.
 """
+import fnmatch
+import glob
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import traceback
@@ -42,7 +45,8 @@ HUMAN_CLI = re.compile(r"(?:-m\s+beacon(?:\.cli)?|\bbeacon(?:\.cli)?(?:\s|$)|/be
                        r"(?:--run\s+\S+\s+)?(answer|verify|set-verify|reopen|config|lighthouse|init|"
                        r"setup-project|teardown-project)\b")
 WEB_TOOLS = ("WebSearch", "WebFetch")
-PROTECTED_NAMES = ("settings.json", "settings.local.json")
+# under .claude/; beacon-setup.json is setup's record of what it added (teardown removes exactly that)
+PROTECTED_NAMES = ("settings.json", "settings.local.json", "beacon-setup.json")
 
 
 def _append_jsonl(run, name, obj):
@@ -222,34 +226,472 @@ def _under(path, roots):
 
 # An agent definition can carry `permissionMode: bypassPermissions`: one the worker writes (project
 # .claude/agents or the user's ~/.claude/agents) would hand a subagent every permission. setup-project denies
-# the edit (PROTECT_DENY); this guard covers Bash and other MCP servers' file tools too.
-AGENTS_NEEDLE = ".claude/agents"
+# the edit (PROTECT_DENY: Edit/Write and every built-in file tool); this guard covers Bash and other MCP
+# servers' file tools too.
+#
+# Precise, not a substring test: a path is an agent definition only when one of its components is `.claude`
+# and the next is `agents` (whole components, case-insensitive like macOS file systems), after `~` expansion,
+# `abspath` and resolving the symlinks of its existing prefix (`.claude/agents-notes.md`, `~/.claude/agentsX`
+# are not). Only writes are refused: reading an agent file is harmless.
+#
+# Bash is parsed, not grepped, and a shell parse cannot be complete. Recognised (refused when a target is an
+# agent definition): redirections (`>`, `>>`, `&>`, `N>`, `>|`, `<>`), `tee`, `cp`/`mv`/`ln`/`install`/
+# `rsync`/`ditto`/`scp` destinations (`mv` and `ln` every operand; a recursive copy or a move onto a `.claude`
+# directory too), `rm`/`rmdir`/`unlink`/`touch`/`mkdir`/`truncate`/`chmod`/... operands, `dd of=`, `sed -i` /
+# `perl -i`, editors (vi, vim, nano, emacs, ed, ex, ...), `curl -o`, `wget -O/-P`, `tar -C`/`-f`, `unzip -d`,
+# `git checkout|restore|mv|rm|...` operands, `find ... -delete|-exec`, and `python|perl|ruby|node|... -c/-e`
+# code that names an agent path and writes. Followed through: `cd`/`pushd` within the command, `VAR=...`
+# assignments and environment variables, globs and brace lists (matched against the component names, and
+# expanded against the disk), quoting, `$(...)`, backticks, `bash -c`, `eval`, `sudo`/`env`/`xargs`/...
+# prefixes, and heredocs fed to a shell or an interpreter. An unknown variable stands for one unknown
+# component; a command that does not parse is refused when it names `.claude` next to `agents` at all.
+# NOT recognised (documented gaps; the deny rules still cover the built-in Edit/Write tools, and Claude Code's
+# auto-mode classifier is another layer): a script file run by an interpreter, a variable holding several
+# components (`D=$(...); cat > "$D/x"` where `$D` is computed), writes into the current directory by a
+# program not listed (`git checkout <branch>`, an archive extracted without `-C`), hard links, and an MCP
+# server rooted inside `.claude` given a path relative to it.
 AGENTS_DENIED = ("Agent definitions (.claude/agents in the project or your home) are off-limits during a beacon "
-                 "run: one could grant a subagent permissions the run does not have.")
+                 "run: one could grant a subagent permissions the run does not have. Reading them is allowed.")
+_GLOB = re.compile(r"[*?\[]")
+_UNKNOWN = "\x00"                       # stands for an unresolved variable: one unknown component
+_UNKNOWN_CWD = "/" + _UNKNOWN           # the directory after a `cd` whose target is unknown
 
 
-def _is_agent_definition(path):
-    """Is `path` (as written, or resolved through symlinks) inside some `.claude/agents` directory?
-    Compared case-insensitively: macOS file systems usually are."""
+def _component_is(comp, name):
+    c = comp.lower()
+    if c == name:
+        return True
+    if _UNKNOWN in c:
+        return True
+    return bool(_GLOB.search(c)) and fnmatch.fnmatchcase(name, c)
+
+
+def _has_agents_pair(path):
+    comps = path.split("/")
+    return any(_component_is(a, ".claude") and _component_is(b, "agents") and not (_UNKNOWN in a and _UNKNOWN in b)
+               for a, b in zip(comps, comps[1:]))
+
+
+def _path_forms(path, cwd):
+    """The absolute forms of `path` to test: `abspath` (`./`, `//`, `..` folded) and `realpath` (symlinks of
+    the existing prefix resolved), relative paths against `cwd`; a glob also by what it matches on disk."""
+    p = os.path.expanduser(path)
+    if not os.path.isabs(p):
+        p = os.path.join(cwd or os.getcwd(), p)
+    forms = {os.path.normpath(p)}
     try:
-        forms = {os.path.abspath(os.path.expanduser(path)), os.path.realpath(os.path.expanduser(path))}
+        forms.add(os.path.realpath(p))
+        if _GLOB.search(p) and _UNKNOWN not in p:
+            for g in glob.glob(p)[:200]:
+                forms.add(os.path.realpath(g))
+    except (OSError, ValueError):
+        pass
+    return forms
+
+
+def is_agent_definition(path, cwd=None):
+    """Is `path` inside (or is it) a `.claude/agents` directory: a whole `.claude` component followed by a
+    whole `agents` component, as written (after `~`, `abspath`) or with the symlinks of its existing prefix
+    resolved? Case-insensitive (macOS file systems usually are)."""
+    if not isinstance(path, str) or not path or "\n" in path or len(path) > 4096:
+        return False
+    if path.startswith("file://"):
+        path = path[len("file://"):]
+    try:
+        return any(_has_agents_pair(f) for f in _path_forms(path, cwd))
     except (TypeError, ValueError):
         return False
-    needle = os.sep + os.path.join(".claude", "agents") + os.sep
-    return any(needle.lower() in (f + os.sep).lower() for f in forms)
+
+
+_is_agent_definition = is_agent_definition     # the name 171f4e5 used
+
+
+# ---- Bash: what a command writes
+_PUNCT = "();<>|&\n"
+_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
+_VAR = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*)|[({'\"]|\W|$)")
+_BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh"}
+_INTERP = re.compile(r"^(?:python[\d.]*|pypy[\d.]*|perl[\d.]*|ruby|node|nodejs|bun|deno|php|osascript|lua|"
+                     r"rscript|tclsh|jshell|swift)$")
+_HEREDOC_SHELL = re.compile(r"(?:^|[\s;|&(])(?:\S*/)?(?:(?:ba|z|da|k|c|tc)?sh|fish|eval|source)(?=[\s;|&)]|$)")
+_HEREDOC_INTERP = re.compile(r"(?:^|[\s;|&(])(?:\S*/)?(?:python[\d.]*|pypy[\d.]*|perl[\d.]*|ruby|node|bun|deno|php|"
+                             r"osascript|lua)(?=[\s;|&)]|$)")
+_WRAPPERS = {"sudo", "doas", "env", "nohup", "time", "command", "builtin", "exec", "nice", "ionice", "timeout",
+             "gtimeout", "stdbuf", "caffeinate", "chronic", "unbuffer", "then", "do", "else", "elif", "if",
+             "while", "until", "!", "{", "}", "xargs", "arch", "script", "watch", "parallel"}
+_WRAPPER_ARG_OPTS = {"sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"}, "doas": {"-u", "-C"},
+                     "env": {"-u", "-C", "-S", "-P"}, "nice": {"-n"}, "ionice": {"-c", "-n", "-p"},
+                     "timeout": {"-s", "-k", "--signal", "--kill-after"}, "gtimeout": {"-s", "-k"},
+                     "xargs": {"-I", "-J", "-L", "-n", "-P", "-R", "-S", "-s", "-E", "-d", "-a"},
+                     "arch": {"-arch"}, "watch": {"-n", "-d"}, "stdbuf": {"-i", "-o", "-e"}}
+_ALL_OPERANDS = {"rm", "rmdir", "unlink", "touch", "mkdir", "truncate", "shred", "srm", "chmod", "chown", "chgrp",
+                 "chflags", "xattr", "setfacl", "mkfifo", "mknod", "mv", "gmv", "ln", "gln", "tee", "gtee",
+                 "sponge", "split", "csplit", "mktemp"}
+_DEST = {"cp", "gcp", "install", "ginstall", "rsync", "ditto", "scp", "rcp"}
+_EDITORS = {"vi", "vim", "nvim", "gvim", "mvim", "nano", "pico", "emacs", "emacsclient", "ed", "red", "ex", "micro",
+            "joe", "jed", "kak", "hx", "helix", "mate", "subl", "code"}
+_GIT_WRITE = {"checkout", "restore", "mv", "rm", "apply", "clone", "worktree", "stash", "reset", "switch", "am",
+              "cherry-pick", "revert", "merge", "pull"}
+_CWD_WRITERS = {"wget", "unzip", "7z", "7za", "cpio", "patch", "aa"}          # write into the cwd by default
+_CODE_AGENTS = re.compile(r"\.claude\W{0,12}agents(?![\w.-])", re.I)
+_CODE_WRITE = re.compile(r"\b(?:write\w*|writelines|dump|copy\w*|move|rename\w*|replace|symlink\w*|link\w*|"
+                         r"mkdir\w*|makedirs|touch|unlink\w*|remove|rmtree|rm\w*|truncate|system|popen|Popen|run|"
+                         r"call|check_call|check_output|exec\w*|spawn\w*|chmod\w*|append\w*|output\w*|"
+                         r"put\w*|save\w*|create\w*|open\w*|mv|cp|install)\b|>")
+_READ_OPEN_ONLY = re.compile(r"\bopen\s*\(([^()]*)\)")
+
+
+def _expand_vars(word, env):
+    """$NAME / ${NAME} from the command's own assignments, then this environment; anything else (`$(...)`,
+    `$1`, an unknown name) becomes the unknown-component marker."""
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        if name is not None:
+            val = env.get(name, os.environ.get(name))
+            return _UNKNOWN if val is None else val
+        return _UNKNOWN + m.group(0)[1:]
+    return _VAR.sub(sub, word) if "$" in word else word
+
+
+def _braces(word, limit=64):
+    out, todo = [], [word]
+    while todo and len(out) + len(todo) <= limit:
+        w = todo.pop()
+        m = _BRACE.search(w)
+        if not m:
+            out.append(w)
+            continue
+        todo += [w[:m.start()] + alt + w[m.end():] for alt in m.group(1).split(",")]
+    return out + todo
+
+
+def _split_heredocs(cmd):
+    """-> (the command with heredoc bodies taken out, [(line holding the `<<`, body, unterminated)])."""
+    lines, out, docs, i = cmd.split("\n"), [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for m in _HEREDOC.finditer(line):
+            before = line[:m.start()]
+            if before.count("'") % 2 or before.count('"') % 2:
+                continue                                 # inside quotes: not a heredoc
+            dash, delim, body = m.group(1), m.group(3), []
+            while i < len(lines) and (lines[i].lstrip("\t") if dash else lines[i]) != delim:
+                body.append(lines[i])
+                i += 1
+            docs.append((line, "\n".join(body), i >= len(lines)))
+            i += 1                                       # the delimiter line
+    return "\n".join(out), docs
+
+
+def _tokens(cmd):
+    lex = shlex.shlex(cmd.replace("\\\n", " ").replace("`", ";"), posix=True, punctuation_chars=_PUNCT)
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    lex.commenters = ""
+    return list(lex)
+
+
+def _is_punct(tok):
+    return bool(tok) and all(c in _PUNCT for c in tok)
+
+
+def _code_writes(code, cwd):
+    """Interpreter code (`python -c`, a heredoc fed to python, ...): names an agent path and writes?"""
+    names_one = bool(_CODE_AGENTS.search(code))
+    if not names_one:
+        for m in re.finditer(r"[\w.~/$*?\[\]{}-]*agents[\w.~/$*?\[\]{}-]*", code, re.I):
+            if any(is_agent_definition(w, cwd) for w in _braces(m.group(0))):
+                names_one = True
+                break
+    if not names_one or not _CODE_WRITE.search(code):
+        return False
+    stripped = _READ_OPEN_ONLY.sub(lambda m: "" if not re.search(r"['\"][rbt]*[wax+][rbt+]*['\"]|mode", m.group(1))
+                                   else m.group(0), code)
+    return bool(_CODE_WRITE.search(stripped))
+
+
+def bash_writes_agent_definition(cmd, cwd=None, _depth=0):
+    """Does the shell command (as far as it can be parsed) write into a `.claude/agents` directory?"""
+    if _depth > 4:
+        return bool(_CODE_AGENTS.search(cmd))
+    cmd, docs = _split_heredocs(cmd)
+    for line, body, unterminated in docs:
+        # a body fed to a shell is a script, one fed to an interpreter is code; an unterminated one (no
+        # delimiter line: bash reads to the end) is checked as a script too; any other body is data
+        if (unterminated or _HEREDOC_SHELL.search(line)) and bash_writes_agent_definition(body, cwd, _depth + 1):
+            return True
+        if _HEREDOC_INTERP.search(line) and _code_writes(body, cwd):
+            return True
+    try:
+        toks = _tokens(cmd)
+    except ValueError:                           # unbalanced quotes: no parse, so no precision either
+        return bool(_CODE_AGENTS.search(cmd))
+    st = {"cwd": cwd or os.getcwd(), "env": {}}
+    words, redirs, i = [], [], 0
+    while i < len(toks):
+        t = toks[i]
+        if _is_punct(t) and not t.endswith("("):
+            if ">" in t or "<" in t:
+                nxt = toks[i + 1] if i + 1 < len(toks) and not _is_punct(toks[i + 1]) else None
+                if nxt is not None and ">" in t and not (t.endswith("&") and re.fullmatch(r"\d+|-", nxt)):
+                    redirs.append(nxt)
+                i += 2 if nxt is not None else 1
+                continue
+        if _is_punct(t):
+            if _simple_writes(words, redirs, st, _depth):
+                return True
+            words, redirs = [], []
+        else:
+            words.append(t)
+        i += 1
+    return _simple_writes(words, redirs, st, _depth)
+
+
+def _operands(args, arg_opts=()):
+    """Positional arguments: options dropped (and the value of an option in `arg_opts`), `--` honoured."""
+    out, i, plain = [], 0, False
+    while i < len(args):
+        a = args[i]
+        if plain or not a.startswith("-") or a == "-":
+            out.append(a)
+        elif a == "--":
+            plain = True
+        elif a in arg_opts:
+            i += 1
+        i += 1
+    return out
+
+
+def _opt_values(args, short, long_=()):
+    """Values of options like `-o FILE`, `-oFILE`, `--output FILE`, `--output=FILE`."""
+    out = []
+    for i, a in enumerate(args):
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        if a in short or a in long_:
+            if nxt is not None:
+                out.append(nxt)
+        elif any(a.startswith(L + "=") for L in long_):
+            out.append(a.split("=", 1)[1])
+        elif any(a.startswith(s) and len(a) > len(s) and not a.startswith("--") for s in short):
+            out.append(a[2:])
+    return out
+
+
+def _simple_writes(words, redirs, st, depth):
+    env, cwd = st["env"], st["cwd"]
+
+    def expand(w):
+        return _braces(_expand_vars(w, env))
+
+    def agent(w, here=None):
+        return any(is_agent_definition(x, here or cwd) for x in expand(w))
+
+    if any(agent(r) for r in redirs):
+        return True
+    words = list(words)
+    while words and _ASSIGN.match(words[0]):                 # VAR=value [command]
+        name, val = words.pop(0).split("=", 1)
+        env[name] = _expand_vars(val, env)
+    if len(words) >= 3 and words[0] in ("for", "select") and words[2] == "in":
+        # `for f in .claude/agents/*; do rm "$f"; done`: the loop variable stands for its agent-path value
+        vals = [x for w in words[3:] for x in expand(w)]
+        env[words[1]] = next((v for v in vals if is_agent_definition(v, cwd)), vals[0] if vals else _UNKNOWN)
+        return False
+    # prefixes that run the rest as a command
+    while words:
+        w0 = os.path.basename(words[0]).lower()
+        if w0 == "export" or w0 == "local" or w0 == "declare" or w0 == "readonly":
+            for a in words[1:]:
+                if _ASSIGN.match(a):
+                    name, val = a.split("=", 1)
+                    env[name] = _expand_vars(val, env)
+            return False
+        if w0 not in _WRAPPERS:
+            break
+        words.pop(0)
+        opts = _WRAPPER_ARG_OPTS.get(w0, set())
+        while words and (words[0].startswith("-") or (w0 == "env" and _ASSIGN.match(words[0]))):
+            a = words.pop(0)
+            if a in opts and words:
+                words.pop(0)
+        if w0 in ("timeout", "gtimeout") and words:
+            words.pop(0)                                     # the duration
+    if not words:
+        return False
+    cmd = os.path.basename(_expand_vars(words[0], env)).lower()
+    args = words[1:]
+    ops = _operands(args)
+    if cmd in ("cd", "pushd", "chdir"):
+        target = ops[0] if ops else "~"
+        if target == "-":
+            st["cwd"] = _UNKNOWN_CWD
+        else:
+            t = _expand_vars(target, env)
+            t = os.path.expanduser(t)
+            st["cwd"] = os.path.normpath(os.path.join(cwd, t)) if _UNKNOWN not in t else _UNKNOWN_CWD
+        return False
+    if cmd == "popd":
+        st["cwd"] = _UNKNOWN_CWD
+        return False
+    if cmd in _SHELLS or cmd == "eval":
+        code = " ".join(args) if cmd == "eval" else next(
+            (args[k + 1] for k, a in enumerate(args[:-1]) if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", a)), None)
+        return bool(code) and bash_writes_agent_definition(code, cwd, depth + 1)
+    if _INTERP.match(cmd):
+        code = _opt_values(args, ("-c", "-e", "-E", "-r"), ("--eval", "--command", "--print"))
+        if cmd.startswith("perl") and any(re.match(r"^-[a-zA-Z]*i", a) for a in args) \
+                and any(agent(o) for o in ops):
+            return True
+        return any(_code_writes(_expand_vars(c, env), cwd) for c in code)
+    if is_agent_definition(cwd) and _writes_into_cwd(cmd, args):
+        return True                                          # its implicit targets land in the agents directory
+    if cmd in _ALL_OPERANDS:
+        if any(agent(o) for o in ops):
+            return True
+        if cmd in ("mv", "gmv") and ops and _is_claude_dir(ops[-1], expand, cwd):
+            return True                                      # a directory moved in as .claude brings agents/
+        return False
+    if cmd in _DEST:
+        ops = _operands(args, {"-t", "-S", "-e", "-m", "-o", "-g", "-B", "--target-directory", "--suffix"})
+        if cmd in ("install", "ginstall") and "-d" in args:
+            return any(agent(o) for o in ops)
+        dests = _opt_values(args, ("-t",), ("--target-directory",)) + (ops[-1:] if len(ops) > 1 else [])
+        if any(agent(d) for d in dests):
+            return True
+        recursive = cmd in ("rsync", "ditto", "scp") or any(
+            a in ("--recursive", "--archive") or re.match(r"^-[a-zA-Z]*[rRa]", a) for a in args)
+        return recursive and any(_is_claude_dir(d, expand, cwd) for d in dests)
+    if cmd == "dd":
+        return any(a.startswith("of=") and agent(a[3:]) for a in args)
+    if cmd in ("sed", "gsed"):
+        return any(a.startswith(("-i", "--in-place")) or re.match(r"^-[a-zA-Z]*i", a) for a in args) \
+            and any(agent(o) for o in ops)
+    if cmd in _EDITORS:
+        return any(agent(o) for o in ops)
+    if cmd == "curl":
+        return any(agent(v) for v in _opt_values(args, ("-o",), ("--output",)))
+    if cmd == "wget":
+        return any(agent(v) for v in _opt_values(args, ("-O", "-P"), ("--output-document", "--directory-prefix")))
+    if cmd in ("tar", "bsdtar", "gtar"):
+        vals = _opt_values(args, ("-C",), ("--directory", "--file"))
+        vals += [args[k + 1] for k, a in enumerate(args[:-1]) if re.fullmatch(r"-?(?=[A-Za-z]*[cru])[A-Za-z]*f", a)]
+        return any(agent(v) for v in vals)
+    if cmd == "unzip":
+        return any(agent(v) for v in _opt_values(args, ("-d",)))
+    if cmd == "git":
+        here = next(iter(_opt_values(args, ("-C",))), None)
+        here = os.path.normpath(os.path.join(cwd, os.path.expanduser(_expand_vars(here, env)))) if here else cwd
+        sub = next((o for o in _operands(args, {"-C", "-c"}) if o in _GIT_WRITE), None)
+        return sub is not None and any(agent(o, here) for o in _operands(args, {"-C", "-c"}))
+    if cmd in ("find", "gfind"):
+        starts = []
+        for a in args:
+            if a.startswith(("-", "(", "!")):
+                break
+            starts.append(a)
+        starts = starts or ["."]
+        if "-delete" in args and any(agent(x) or _is_claude_dir(x, expand, cwd) for x in starts):
+            return True
+        for k, a in enumerate(args):
+            if a in ("-fprint", "-fprintf", "-fls", "-fprint0") and k + 1 < len(args) and agent(args[k + 1]):
+                return True
+            if a in ("-exec", "-execdir", "-ok", "-okdir"):
+                seg = []
+                for b in args[k + 1:]:
+                    if b in (";", "+"):
+                        break
+                    seg.append(b)
+                for x in starts:                             # `{}`: any entry under the start path
+                    sub = [b.replace("{}", x.rstrip("/") + "/*") for b in seg]
+                    if _simple_writes(sub, [], {"cwd": cwd, "env": dict(env)}, depth):
+                        return True
+        return False
+    return False
+
+
+def _writes_into_cwd(cmd, args):
+    """Does the command write into the current directory with no operand naming the target?"""
+    if cmd in _CWD_WRITERS:
+        return True
+    if cmd == "curl":
+        return any(a in ("--remote-name", "--remote-name-all") or re.match(r"^-[a-zA-Z]*[OJ]", a) for a in args)
+    if cmd in ("tar", "bsdtar", "gtar"):
+        return bool(args) and (args[0].lstrip("-").isalpha() and "x" in args[0]
+                               or any(a in ("-x", "--extract", "--get") for a in args))
+    if cmd in ("ditto", "pax"):
+        return any(a in ("-x", "-r") for a in args)
+    if cmd == "git":
+        return any(o in _GIT_WRITE for o in _operands(args, {"-C", "-c"}))
+    return False
+
+
+def _is_claude_dir(word, expand, cwd):
+    """Is the target a `.claude` directory itself (whose `agents/` a recursive copy or move would create)?"""
+    for x in expand(word):
+        p = os.path.expanduser(x)
+        p = os.path.normpath(os.path.join(cwd, p))
+        if _component_is(os.path.basename(p), ".claude"):
+            return True
+    return False
+
+
+# ---- other MCP servers' tools
+_MCP_READ = re.compile(r"^(?:read|get|list|search|find|view|show|stat|describe|query|directory_tree|tree|glob|grep|"
+                       r"head|tail|cat|ls|count|exists|inspect|lookup|preview|fetch|start_search|stop_search|diff|"
+                       r"compare|whoami|info|status|help|check)(?:_|$)")
+_MCP_COMMAND_KEYS = {"command", "cmd", "shell", "commands"}         # shell command lines
+_MCP_CODE_KEYS = {"script", "input", "code"}                         # a script or REPL input: shell or code
+
+
+def _mcp_is_read(tool):
+    name = tool.split("__")[-1]
+    name = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).replace("-", "_").lower()
+    return bool(_MCP_READ.match(name))
+
+
+def _strings(obj, key=None, depth=0):
+    if depth > 6:
+        return
+    if isinstance(obj, str):
+        yield key, obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _strings(v, str(k).lower(), depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _strings(v, key, depth + 1)
+
+
+def mcp_writes_agent_definition(tool, tool_input, cwd=None):
+    """Another MCP server's tool: a write operation (any tool not named like a read: read_*, get_*, list_*,
+    search_*, ...) with a path value inside `.claude/agents`, or a command value that writes there."""
+    if _mcp_is_read(tool):
+        return False
+    for key, val in _strings(tool_input):
+        if key in _MCP_COMMAND_KEYS or key in _MCP_CODE_KEYS:     # not a path: what does it write?
+            if bash_writes_agent_definition(val, cwd) or (key in _MCP_CODE_KEYS and _code_writes(val, cwd)):
+                return True
+        elif is_agent_definition(val, cwd):
+            return True
+    return False
 
 
 SUBAGENT_DENIED = ("Only the main session talks to beacon: a subagent does not call the beacon tools. Return what "
                    "you found (with the raw output) to the main session, which records it in the ledger.")
 
 
-def guard(tool, tool_input, roots, cfg, agent_id=None):
+def guard(tool, tool_input, roots, cfg, agent_id=None, cwd=None):
     """Return a denial reason, or None to let the tool run.
 
     agent_id: the PreToolUse input's `agent_id`, present (non-empty) only for a subagent's call. A subagent
     inherits the beacon MCP tools, so "only the main session talks to beacon" is enforced here: every
     mcp__beacon__ call of a subagent is denied. The main session has no agent_id (a session started with
-    an --agent option carries agent_type only), so it is never affected."""
+    an --agent option carries agent_type only), so it is never affected.
+    cwd: the session's working directory (the hook input's `cwd`), for relative paths; default this process's."""
     ti = tool_input or {}
     if agent_id and tool.startswith(OWN_TOOL_PREFIX):
         return SUBAGENT_DENIED
@@ -272,13 +714,13 @@ def guard(tool, tool_input, roots, cfg, agent_id=None):
             if base == ".mcp.json" or (base in PROTECTED_NAMES + ("beacon",) and
                                         os.path.basename(os.path.dirname(os.path.abspath(p))) == ".claude"):
                 return "Claude Code settings and MCP configuration are off-limits during a beacon run."
-            if _is_agent_definition(p):
+            if is_agent_definition(p, cwd):
                 return AGENTS_DENIED
     if tool.startswith("mcp__") and not tool.startswith(OWN_TOOL_PREFIX):
         # another MCP server's tool (a filesystem or shell server) pointed at the supervisor's files
-        blob = json.dumps(ti, ensure_ascii=False)
-        if AGENTS_NEEDLE in blob.lower().replace("\\\\", "/"):
+        if mcp_writes_agent_definition(tool, ti, cwd):
             return AGENTS_DENIED
+        blob = json.dumps(ti, ensure_ascii=False)
         needles = {"ledger.db"} | {v for r in roots for v in _variants(r)}
         hit = next((n for n in needles if n and n in blob), None)
         if hit:
@@ -291,9 +733,9 @@ def guard(tool, tool_input, roots, cfg, agent_id=None):
         if NESTED_CLAUDE.search(cmd):
             return ("Starting another Claude Code session is disabled during a beacon run; use the Agent tool "
                     "for a subagent.")
-        if AGENTS_NEEDLE in cmd.lower():
+        if bash_writes_agent_definition(cmd, cwd):
             return AGENTS_DENIED
-        needles = {"BEACON_RUN", "ledger.db", ".claude/settings", ".mcp.json"}
+        needles = {"BEACON_RUN", "ledger.db", ".claude/settings", ".mcp.json", "beacon-setup.json"}
         for r in roots:
             needles |= _variants(r)
         hit = next((n for n in needles if n and n in cmd), None)
@@ -315,7 +757,8 @@ def pre_tool_use(run, inp):
         _log_error(run, "pre-tool-use (config unreadable; path rules still applied)")
     agent_id = inp.get("agent_id")
     reason = guard(str(inp.get("tool_name", "")), inp.get("tool_input") or {}, protected_paths(run), cfg,
-                   agent_id=agent_id if isinstance(agent_id, str) and agent_id.strip() else None)
+                   agent_id=agent_id if isinstance(agent_id, str) and agent_id.strip() else None,
+                   cwd=inp.get("cwd") if isinstance(inp.get("cwd"), str) and inp.get("cwd") else None)
     if not reason:
         return None
     _append_jsonl(run, "denials.jsonl", {"ts": time.time(), "tool": inp.get("tool_name"), "reason": reason,

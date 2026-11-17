@@ -334,8 +334,9 @@ def cmd_teardown_project(args):
         for c in changes:
             if c.split(":", 1)[0] in kept:
                 print("  " + c)
-        print(("Would keep " if args.dry_run else "Kept ") + ", ".join(kept) + ": each holds content neither its file "
-              "nor git HEAD has, or could not be settled (reason above); delete it by hand once you do not need it.")
+        print(("Would keep " if args.dry_run else "Kept ") + ", ".join(kept) + ": the reason for each is above (content "
+              "neither its file nor git HEAD has, permission bits that differ, or a step that failed); delete it by "
+              "hand once you do not need it.")
     elif changes:
         print("No .beacon-bak or .beacon-bak.old " + ("would be" if args.dry_run else "is") + " left behind.")
     return 0

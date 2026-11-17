@@ -8,6 +8,8 @@ Writes, inside DIR only (apart from the target of a symlinked file, below), merg
   .mcp.json                     the beacon MCP server entry
   CLAUDE.md                     the worker rules (beacon/WORKER.md) between markers,
                                 replaced in place on a re-run
+  .claude/beacon-setup.json     setup's record of what it added because it was absent (written
+                                first; a re-run adds to it), so teardown removes only that
 
 A wired file that is a symlink (CLAUDE.md -> a shared file) is written through: the link stays a link and
 its target, wherever it lives, gets the change. A rewritten file keeps its permission bits.
@@ -19,8 +21,10 @@ overwritten), then a fresh one is taken; a file that is still wired (an interrup
 the real pre-run state. Nothing is removed from an existing file: other hooks, servers, rules and text stay.
 
 `beacon teardown-project DIR` is the inverse: it removes exactly what setup wrote (the rules block,
-beacon's hooks / allow / deny entries, the beacon MCP server, .claude/beacon when it is beacon's wrapper by
-content: any other file there is the project's and is never removed) and keeps everything else; a file
+the hooks / allow / deny entries and the beacon MCP server setup's record lists: a rule, hook or server the
+user had before setup stays, one setup rewrote gets its old value back; .claude/beacon when it is beacon's
+wrapper by content: any other file there is the project's and is never removed; the record, last) and
+keeps everything else; a file
 setup created that is left with nothing in it is removed. When what is left equals setup's .beacon-bak, the backup
 is put back byte for byte (line endings, trailing blank lines, JSON formatting, mode), so a run that
 changed nothing leaves no diff; a file setup created is removed; an edit the user made during the run
@@ -56,6 +60,7 @@ HOOK_EVENTS = (("Stop", "stop", 300), ("SessionStart", "session-start", 30),
 # (Edit rules cover every built-in file-editing tool.)
 PROTECT_DENY = ("Edit(**/ledger.db*)", "Bash(sqlite3 *)", "Edit(**/.claude/settings.json)",
                 "Edit(**/.claude/settings.local.json)", "Edit(**/.mcp.json)", "Edit(**/.claude/beacon)",
+                "Edit(**/.claude/beacon-setup.json)",
                 # agent definitions: one can carry `permissionMode: bypassPermissions` for the subagent it starts
                 "Edit(**/.claude/agents/**)", "Edit(~/.claude/agents/**)") + tuple(
     f"Bash(.claude/beacon {c} *)" for c in ("answer", "verify", "set-verify", "reopen", "config", "lighthouse",
@@ -68,6 +73,9 @@ PYTHONPATH="{repo}${{PYTHONPATH:+{sep}$PYTHONPATH}}" exec "{python}" -m beacon "
 MARK_BEGIN = "<!-- beacon:worker-rules:begin -->"
 MARK_END = "<!-- beacon:worker-rules:end -->"
 BAK = ".beacon-bak"
+# setup's record of what it added (because it was absent); teardown removes exactly that
+RECORD = os.path.join(".claude", "beacon-setup.json")
+RECORD_KEY = "beacon_setup"
 WIRED = ("CLAUDE.md", ".mcp.json", os.path.join(".claude", "settings.local.json"),
          os.path.join(".claude", "settings.json"), os.path.join(".claude", "beacon"))
 
@@ -214,9 +222,11 @@ def _free_name(base):
     return name
 
 
-def _is_wired(path, name=None):
+def _is_wired(path, name=None, record=None):
     """Does the file still hold what setup writes? True / False, None when it cannot be read or parsed.
-    name: the wired file's name when `path` is a copy of it (a backup)."""
+    name: the wired file's name when `path` is a copy of it (a backup). record: setup's record
+    (`_read_record`): a JSON file then holds what setup wrote only when it holds what the record says setup
+    added; without one (an older setup) any beacon part counts."""
     name = name or os.path.basename(path)
     try:
         if name == "beacon":
@@ -226,13 +236,13 @@ def _is_wired(path, name=None):
             with open(path, encoding="utf-8") as fh:
                 return bool(strip_claude_md(fh.read())[1])
         if name == ".mcp.json":
-            return bool(strip_mcp(_read_json(path))[1])
-        return bool(strip_settings(_read_json(path))[1])
+            return bool(strip_mcp(_read_json(path), _entry(record, name))[1])
+        return bool(strip_settings(_read_json(path), _entry(record, name))[1])
     except (OSError, ValueError):
         return None
 
 
-def _setup_backup(path, dry_run):
+def _setup_backup(path, dry_run, wired=None):
     """Make sure the backup this run uses is this run's pre-run state. -> messages.
 
     No backup: one is taken of an existing file that is not wired; a file still wired with no backup was
@@ -242,10 +252,13 @@ def _setup_backup(path, dry_run):
     free `<file>.beacon-bak.old[.N]` (never deleted, never overwriting anything) and a fresh one is taken;
     when the file does not exist at all, setup creates it and there is no fresh backup to take. A
     `.claude/beacon` backup holding a beacon wrapper is beacon's own file, not a copy of the project's: it
-    is removed first, and the project's file (if any) is backed up instead."""
+    is removed first, and the project's file (if any) is backed up instead.
+    wired: whether the file still holds what an earlier setup added (settings and .mcp.json: decided from
+    setup's record); None: decided from the content (`_is_wired`)."""
     bak = path + BAK
     exists = os.path.exists(path)
-    wired = _is_wired(path) if exists else False
+    if wired is None or not exists:
+        wired = _is_wired(path) if exists else False
     out = []
     if os.path.basename(path) == "beacon" and _is_wrapper_backup(path):
         # beacon's own command (an older version backed it up): no copy of anything the project owns, and it
@@ -304,23 +317,52 @@ def setup_project(project, python, mcp_python, shared=False, allow_labhand=False
 
     sp = os.path.join(project, ".claude", "settings.json" if shared else "settings.local.json")
     other = os.path.join(project, ".claude", "settings.local.json" if shared else "settings.json")
-    new, ch = merge_settings(_read_json(sp), python, allow=allow, skip_events=beacon_events(_read_json(other)))
+    mp = os.path.join(project, ".mcp.json")
+    s_before, o_before, m_before = _read_json(sp), _read_json(other), _read_json(mp)
+    old_record = _read_record(project)
+    new, ch = merge_settings(s_before, python, allow=allow, skip_events=beacon_events(o_before))
     if quiet_shell and new.get("respondToBashCommands") is not False:
         new["respondToBashCommands"] = False      # `! cmd` output lands in the chat without a model reply
         ch.append("set respondToBashCommands=false (shell-mode output gets no automatic reply)")
+    new_mcp, ch_mcp = merge_mcp(m_before, mcp_python)
+
+    # The record of what setup adds because it is absent, written before any wired file: an interrupted
+    # setup leaves a record that covers what it wrote. A re-run (an interrupted run, a moved checkout) adds
+    # to it; what an earlier setup recorded stays recorded, and what was there before stays the user's.
+    files = dict(old_record["files"]) if old_record else {}
+    wired = {}
+    for path, before, after, legacy, make, merge in (
+            (sp, s_before, new, _legacy_settings_entry, _settings_record, _merge_settings_entry),
+            (other, o_before, o_before, _legacy_settings_entry, _settings_record, _merge_settings_entry),
+            (mp, m_before, new_mcp, _legacy_mcp_entry, _mcp_record, _merge_mcp_entry)):
+        name = os.path.basename(path)
+        inherited = (old_record["files"].get(name) if old_record else legacy(path, before))
+        strip = strip_mcp if name == ".mcp.json" else strip_settings
+        live = _holds_entry(name, before, inherited)
+        wired[name] = live is True and bool(strip(before, inherited)[1])
+        # an entry whose file does not hold what it lists is stale (an interrupted setup that never got to
+        # the file, an interrupted teardown that already stripped it): the file as it is now is the pre-run
+        # state, and a rule the user added since (even one equal to beacon's) is theirs
+        files[name] = merge(None if live is False else inherited, make(before, after))
+    record = {RECORD_KEY: 1, "files": files}
+    if record != old_record:
+        rp = os.path.join(project, RECORD)
+        changes.append(f"{RECORD}: {'recorded' if old_record is None else 'updated the record of'} what setup "
+                       f"added (teardown removes only that; what you had before stays)")
+        _write(rp, json.dumps(record, indent=2) + "\n", dry_run, backup=False)
+
     ch_real = [c for c in ch if not c.startswith("left ")]
     notes = [c for c in ch if c.startswith("left ")]
     changes += [f"{os.path.relpath(sp, project)}: {c}" for c in notes]
     ch = ch_real
     if ch:
-        changes += [f"{os.path.relpath(sp, project)}: {c}" for c in ch + _setup_backup(sp, dry_run)]
+        changes += [f"{os.path.relpath(sp, project)}: {c}"
+                    for c in ch + _setup_backup(sp, dry_run, wired[os.path.basename(sp)])]
         _write(sp, json.dumps(new, indent=2) + "\n", dry_run, backup=False)
 
-    mp = os.path.join(project, ".mcp.json")
-    new, ch = merge_mcp(_read_json(mp), mcp_python)
-    if ch:
-        changes += [f".mcp.json: {c}" for c in ch + _setup_backup(mp, dry_run)]
-        _write(mp, json.dumps(new, indent=2) + "\n", dry_run, backup=False)
+    if ch_mcp:
+        changes += [f".mcp.json: {c}" for c in ch_mcp + _setup_backup(mp, dry_run, wired[".mcp.json"])]
+        _write(mp, json.dumps(new_mcp, indent=2) + "\n", dry_run, backup=False)
 
     wp = os.path.join(project, ".claude", "beacon")
     # the wrapper runs under sh / Git Bash; the separator is the one Python on this OS splits PYTHONPATH on
@@ -351,6 +393,158 @@ def setup_project(project, python, mcp_python, shared=False, allow_labhand=False
     return changes
 
 
+# ---------------------------------------------------------------- setup's record
+def _read_record(project):
+    """Setup's record (`RECORD`), or None when there is none (no setup, or one older than the record).
+    A record that is not one is an error for the human, never guessed around."""
+    path = os.path.join(project, RECORD)
+    if not os.path.lexists(path):
+        return None
+    obj = _read_json(path)
+    if obj.get(RECORD_KEY) != 1 or not isinstance(obj.get("files"), dict) \
+            or not all(isinstance(v, dict) for v in obj["files"].values()):
+        raise ValueError(f"{path} is not beacon setup's record; remove it by hand if it is stale")
+    return obj
+
+
+def _entry(record, name):
+    """The record's entry for the wired file `name` (basename): {} when the record has none, None when there
+    is no record at all (an older setup: teardown then falls back to removing every beacon part)."""
+    if record is None:
+        return None
+    return record["files"].get(os.path.basename(name)) or {}
+
+
+def _list(v):
+    return v if isinstance(v, list) else []
+
+
+def _rules(settings, key):
+    perms = (settings or {}).get("permissions")
+    return _list(perms.get(key)) if isinstance(perms, dict) else []
+
+
+def _beacon_hooks(settings, event):
+    """The beacon hook dicts of `event` in a settings dict, in order."""
+    hooks = (settings or {}).get("hooks")
+    out = []
+    for g in _list(hooks.get(event)) if isinstance(hooks, dict) else []:
+        for h in _list(g.get("hooks")) if isinstance(g, dict) else []:
+            if isinstance(h, dict) and BEACON_HOOK.search(str(h.get("command", ""))):
+                out.append(h)
+    return out
+
+
+def _settings_record(before, after):
+    """What `after` holds of beacon's that `before` lacks: hooks of events that had none (added) or whose
+    beacon hook setup rewrote (replaced: the old ones, put back by teardown), beacon's allow / deny rules,
+    the keys setup set; plus what teardown must leave: whether `beacon` was enabled in
+    enabledMcpjsonServers, and the mcp__beacon__* approvals there already were."""
+    before, after = before or {}, after or {}
+    added, replaced = [], {}
+    for event, _, _ in HOOK_EVENTS:
+        b, a = _beacon_hooks(before, event), _beacon_hooks(after, event)
+        if a and not b:
+            added.append(event)
+        elif b and a != b:
+            replaced[event] = json.loads(json.dumps(b))
+    allow_b, deny_b = _rules(before, "allow"), _rules(before, "deny")
+    keys = {}
+    for k in ("respondToBashCommands",):
+        if k in after and (k not in before or before[k] != after[k]):
+            keys[k] = {"set": after[k], "had": k in before, "value": before.get(k)}
+    return {"hooks": added, "hooks_replaced": replaced,
+            "allow": [r for r in _rules(after, "allow") if r not in allow_b and (_ours_allow(r) or r == "mcp__labhand")],
+            "deny": [r for r in _rules(after, "deny") if r not in deny_b and _ours_deny(r)],
+            "keys": keys, "enabled_had": "beacon" in _list(before.get("enabledMcpjsonServers")),
+            "beacon_tools_had": [r for r in allow_b if str(r).startswith("mcp__beacon__")]}
+
+
+def _holds_entry(name, cur, entry):
+    """Does the file `name` (its object `cur`) still hold everything the record entry says setup added?
+    True / False; None when the entry lists nothing to check (no entry, or only what was there before)."""
+    if not entry:
+        return None
+    if name == ".mcp.json":
+        servers = (cur or {}).get("mcpServers")
+        b = servers.get("beacon") if isinstance(servers, dict) else None
+        if entry.get("server") == "added":
+            return b is not None
+        if entry.get("server") == "replaced":
+            return b is not None and b != entry.get("old")
+        return None
+    hooks, allow, deny = _list(entry.get("hooks")), _list(entry.get("allow")), _list(entry.get("deny"))
+    replaced = entry.get("hooks_replaced") or {}
+    if not (hooks or allow or deny or replaced):
+        return None
+    return (all(_beacon_hooks(cur, e) for e in hooks)
+            and all(_beacon_hooks(cur, e) and _beacon_hooks(cur, e) != old for e, old in replaced.items())
+            and all(r in _rules(cur, "allow") for r in allow) and all(r in _rules(cur, "deny") for r in deny))
+
+
+def _merge_settings_entry(old, new):
+    """An earlier setup's entry (kept as it is: it knows the pre-run state) plus what this setup adds."""
+    if not old:
+        return new
+    e = json.loads(json.dumps(old))
+    for k in ("hooks", "allow", "deny", "beacon_tools_had"):
+        e.setdefault(k, [])
+    e.setdefault("hooks_replaced", {})
+    e.setdefault("keys", {})
+    e.setdefault("enabled_had", new["enabled_had"])
+    known = set(e["hooks"]) | set(e["hooks_replaced"])
+    e["hooks"] += [x for x in new["hooks"] if x not in known]
+    e["hooks_replaced"].update({k: v for k, v in new["hooks_replaced"].items() if k not in known})
+    for k in ("allow", "deny"):
+        e[k] += [r for r in new[k] if r not in e[k]]
+    e["keys"].update({k: v for k, v in new["keys"].items() if k not in e["keys"]})
+    return e
+
+
+def _mcp_record(before, after):
+    b = ((before or {}).get("mcpServers") or {}).get("beacon") if isinstance((before or {}).get("mcpServers"), dict) else None
+    a = ((after or {}).get("mcpServers") or {}).get("beacon") if isinstance((after or {}).get("mcpServers"), dict) else None
+    if a is not None and b is None:
+        return {"server": "added"}
+    if b is not None and a != b:
+        return {"server": "replaced", "old": b}
+    return {}
+
+
+def _merge_mcp_entry(old, new):
+    return old if old and old.get("server") else new
+
+
+def _legacy_settings_entry(path, cur):
+    """No record (the project was wired by a setup older than it, and not torn down): what of `cur` is
+    beacon's, judged from that setup's .beacon-bak (its pre-run state); with no backup, only a file that
+    holds nothing but beacon's parts, among them the `mcp__beacon` allow rule every setup since the first has
+    written (that setup created it; a user's own file with, say, only a beacon hook is not taken for one).
+    Otherwise None: nothing in it is beacon's."""
+    if not strip_settings(cur)[1]:
+        return None
+    bak = _json_backup(path)
+    if bak is not None:
+        before = bak
+    elif (not strip_settings(cur)[0] and "mcp__beacon" in _rules(cur, "allow")
+          and any(_beacon_hooks(cur, e) for e, _, _ in HOOK_EVENTS)):
+        before = {}
+    else:
+        return None
+    e = _settings_record(before, cur)
+    return e if e["hooks"] or e["hooks_replaced"] or e["allow"] or e["deny"] else None
+
+
+def _legacy_mcp_entry(path, cur):
+    if not strip_mcp(cur)[1]:
+        return None
+    bak = _json_backup(path)
+    if bak is not None:
+        return _mcp_record(bak, cur) or None
+    rest = strip_mcp(cur)[0]
+    return {"server": "added"} if not rest or rest == {"mcpServers": {}} else None
+
+
 # ---------------------------------------------------------------- teardown
 BEACON_HOOK = re.compile(r"-m\s+beacon\.hooks\b")
 BEACON_WRAPPER = re.compile(rb'-m\s+beacon\s+"\$@"')       # a wrapper setup wrote (any version)
@@ -365,8 +559,15 @@ def _ours_deny(rule):
     return rule in PROTECT_DENY or str(rule).startswith("Bash(.claude/beacon ")
 
 
-def strip_settings(settings):
-    """Return (new_settings, changes): beacon's hooks, allow and deny rules removed, the rest kept."""
+def strip_settings(settings, rec=None):
+    """Return (new_settings, changes): beacon's hooks, allow and deny rules removed, the rest kept.
+
+    rec: setup's record entry for this file (`_entry`): only what setup added is removed (a hook of an event
+    it added, the allow / deny rules it added, a key it set), a beacon hook it rewrote gets its old value
+    back, and `beacon` leaves enabledMcpjsonServers (and mcp__beacon__* approvals the allow list) only when
+    they were not there before setup. None (no record: an older setup): every beacon part is removed."""
+    if rec is not None:
+        return _strip_settings_recorded(settings, rec)
     s = json.loads(json.dumps(settings or {}))
     changes = []
     hooks = s.get("hooks")
@@ -418,10 +619,104 @@ def strip_settings(settings):
     return s, changes
 
 
-def strip_mcp(cfg):
+def _strip_settings_recorded(settings, rec):
+    s = json.loads(json.dumps(settings or {}))
+    changes = []
+    added, replaced = set(_list(rec.get("hooks"))), rec.get("hooks_replaced") or {}
+    hooks = s.get("hooks")
+    if isinstance(hooks, dict):
+        for event in list(hooks):
+            groups = hooks[event]
+            if not isinstance(groups, list):
+                continue
+            olds = list(_list(replaced.get(event)))
+            kept_groups = []
+            for g in groups:
+                inner = g.get("hooks") if isinstance(g, dict) else None
+                if not isinstance(inner, list):
+                    kept_groups.append(g)
+                    continue
+                kept = []
+                for h in inner:
+                    if not (isinstance(h, dict) and BEACON_HOOK.search(str(h.get("command", "")))):
+                        kept.append(h)
+                    elif event in replaced:
+                        old = olds.pop(0) if olds else h
+                        if old != h:
+                            changes.append(f"restored your {event} hook as it was before setup")
+                        kept.append(old)
+                    elif event in added:
+                        changes.append(f"removed {event} hook")
+                    else:
+                        kept.append(h)                       # yours: it was there before setup
+                if kept:
+                    kept_groups.append(dict(g, hooks=kept))
+            if kept_groups:
+                hooks[event] = kept_groups
+            else:
+                del hooks[event]
+        if not hooks:
+            del s["hooks"]
+    perms = s.get("permissions")
+    if isinstance(perms, dict):
+        had_tools = set(_list(rec.get("beacon_tools_had")))
+        for key, ours in (("allow", lambda r: r in _list(rec.get("allow")) or (
+                              str(r).startswith("mcp__beacon__") and r not in had_tools)),
+                          ("deny", lambda r: r in _list(rec.get("deny")))):
+            rules = perms.get(key)
+            if not isinstance(rules, list):
+                continue
+            gone = [r for r in rules if ours(r)]
+            if gone:
+                perms[key] = [r for r in rules if not ours(r)]
+                changes += [f"removed {'allowed' if key == 'allow' else 'denied'} {r}" for r in gone]
+            if not perms[key]:
+                del perms[key]
+        if not perms:
+            del s["permissions"]
+    for k, info in (rec.get("keys") or {}).items():
+        if isinstance(info, dict) and k in s and s[k] == info.get("set"):
+            if info.get("had"):
+                if info.get("value") != s[k]:
+                    s[k] = info.get("value")
+                    changes.append(f"set {k} back to {json.dumps(info.get('value'))}")
+            else:
+                del s[k]
+                changes.append(f"removed {k}")
+    servers = s.get("enabledMcpjsonServers")
+    if isinstance(servers, list) and "beacon" in servers and not rec.get("enabled_had"):
+        s["enabledMcpjsonServers"] = [x for x in servers if x != "beacon"]
+        changes.append("removed beacon from enabledMcpjsonServers")
+        if not s["enabledMcpjsonServers"]:
+            del s["enabledMcpjsonServers"]
+    return s, changes
+
+
+def _kept_notes(kind, obj):
+    """After a recorded teardown: the beacon parts left because they were there before setup."""
+    _, legacy = (strip_mcp if kind == ".mcp.json" else strip_settings)(obj)
+    out = []
+    for c in legacy:
+        if c.startswith("removed beacon from "):
+            out.append(f"kept beacon in {c[len('removed beacon from '):]} (it was there before setup)")
+        elif c.startswith("removed "):
+            out.append(f"kept {c[len('removed '):]} (it was there before setup)")
+    return out
+
+
+def strip_mcp(cfg, rec=None):
+    """Return (new_cfg, changes): the beacon MCP server removed. rec: setup's record entry: removed only
+    when setup added it, put back as it was when setup replaced it, else left (it was the project's)."""
     c = json.loads(json.dumps(cfg or {}))
     servers = c.get("mcpServers")
     if not isinstance(servers, dict) or "beacon" not in servers:
+        return c, []
+    if rec is not None and rec.get("server") == "replaced":
+        if servers["beacon"] == rec.get("old"):
+            return c, []
+        servers["beacon"] = rec.get("old")
+        return c, ["restored your beacon MCP server entry as it was before setup"]
+    if rec is not None and rec.get("server") != "added":
         return c, []
     del servers["beacon"]
     if not servers:
@@ -478,8 +773,9 @@ class _Teardown:
     files teardown backs up itself (no backup from setup: setup created the file), with the state the
     backup has (or would have)."""
 
-    def __init__(self, dry_run):
+    def __init__(self, dry_run, record=None):
         self.dry_run = dry_run
+        self.record = record
         self.final = {}
         self.made = {}
 
@@ -518,26 +814,26 @@ class _Teardown:
         return _file_state(path)
 
 
-def _strip_json(path, obj):
-    """strip_mcp / strip_settings for the file at `path`, plus the empty `mcpServers` strip_mcp drops only
-    when it removed beacon from it. -> (stripped object, changes)."""
+def _strip_json(path, obj, record=None):
+    """strip_mcp / strip_settings for the file at `path` (by setup's record when there is one), plus the
+    empty `mcpServers` strip_mcp drops only when it removed beacon from it. -> (stripped object, changes)."""
     if os.path.basename(path) != ".mcp.json":
-        return strip_settings(obj)
-    c, ch = strip_mcp(obj)
+        return strip_settings(obj, _entry(record, path))
+    c, ch = strip_mcp(obj, _entry(record, path))
     if c.get("mcpServers") == {}:
         del c["mcpServers"]
     return c, ch
 
 
-def _same_as_backup(path, bak, new):
+def _same_as_backup(path, bak, new, record=None):
     """Is the stripped object `new` what setup found (`bak`)? Exactly, or once the empty containers that
     stripping drops are dropped from both: setup fills `{"mcpServers": {}}` or `"hooks": {}` and stripping
     empties and removes them, which is no change of the user's. A backup that holds beacon's parts (a
     stripped compare would put them back) is never a match this way."""
     if json.dumps(bak) == json.dumps(new):
         return True
-    norm_bak, wired = _strip_json(path, bak)
-    return not wired and json.dumps(norm_bak) == json.dumps(_strip_json(path, new)[0])
+    norm_bak, wired = _strip_json(path, bak, record)
+    return not wired and json.dumps(norm_bak) == json.dumps(_strip_json(path, new, record)[0])
 
 
 def _put_json(path, new, ch, td):
@@ -546,7 +842,7 @@ def _put_json(path, new, ch, td):
     them during the run would be lost) up to the empty containers stripping drops, else the object itself;
     a file left with nothing in it is removed only when setup created it (no backup that matches)."""
     bak = _json_backup(path)
-    if bak is not None and _same_as_backup(path, bak, new):
+    if bak is not None and _same_as_backup(path, bak, new, td.record):
         td.restore(path)
         ch.append("restored the file as it was before setup")
     elif new:
@@ -657,7 +953,7 @@ def _settle_backups(project, td):
             have = _file_state(bak)
         else:
             have = ()
-        teardowns = path in td.made or (have and _is_wired(bak, os.path.basename(path)) is True)
+        teardowns = path in td.made or (have and _is_wired(bak, os.path.basename(path), td.record) is True)
         if have == ():
             pass
         elif have is False:
@@ -726,24 +1022,19 @@ def teardown_project(project, dry_run=False):
     if not os.path.isdir(project):
         raise FileNotFoundError(f"no such project directory: {project}")
     changes = []
-    td = _Teardown(dry_run)
-    for name in ("settings.json", "settings.local.json"):
-        sp = os.path.join(project, ".claude", name)
-        if not os.path.exists(sp):
+    record = _read_record(project)
+    td = _Teardown(dry_run, record)
+    for rel in (os.path.join(".claude", "settings.json"), os.path.join(".claude", "settings.local.json"),
+                ".mcp.json"):
+        path = os.path.join(project, rel)
+        if not os.path.exists(path):
             continue
-        new, ch = strip_settings(_read_json(sp))
-        if not ch:
-            continue
-        rel = os.path.relpath(sp, project)
-        _put_json(sp, new, ch, td)
-        changes += [f"{rel}: {c}" for c in ch]
-
-    mp = os.path.join(project, ".mcp.json")
-    if os.path.exists(mp):
-        new, ch = strip_mcp(_read_json(mp))
+        new, ch = _strip_json(path, _read_json(path), record)
         if ch:
-            _put_json(mp, new, ch, td)
-            changes += [f".mcp.json: {c}" for c in ch]
+            _put_json(path, new, ch, td)
+        if record is not None:
+            ch += _kept_notes(os.path.basename(path), new)
+        changes += [f"{rel}: {c}" for c in ch]
 
     wp = os.path.join(project, ".claude", "beacon")
     # only beacon's own command is touched; any other file there is the project's and stays as it is
@@ -771,4 +1062,14 @@ def teardown_project(project, dry_run=False):
                 ch.append("removed the file (nothing else was in it)")
             changes += [f"CLAUDE.md: {c}" for c in ch]
     # last, so a failure in any step above leaves every backup where it was
-    return changes + _settle_backups(project, td)
+    changes += _settle_backups(project, td)
+    if record is not None:
+        # the record goes last of all: a teardown that stops before this point can be run again
+        rp = os.path.join(project, RECORD)
+        try:
+            if not dry_run:
+                os.remove(rp)
+            changes.append(f"{RECORD}: removed setup's record of what it added")
+        except OSError as e:
+            changes.append(f"{RECORD}: kept setup's record: removing it failed ({e.strerror})")
+    return changes
