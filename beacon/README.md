@@ -406,6 +406,16 @@ measured 2026-11-16). The watchdog treats that as a pause:
 - **The human's channel.** Answers, verification and reopening are the human's. Through
   Bash the worker meets a guard (the CLI's human commands, nested `claude`, scheduled prompts
   are refused), deny rules for `.claude/beacon answer|verify|…`, and the CLI's TTY check;
+  one list, `HUMAN_COMMANDS` in `hooks.py`, drives the guard and the deny rules. It includes
+  `claude`, `watch`, `demo` and `eval`, which start a nested supervised session. The guard
+  reads the command as shell words (quotes, backslashes, `${IFS}` removed; `-mbeacon`, `--`,
+  repeated `--run X`, `env`/`sudo`/`timeout`/`xargs`/`script` prefixes, `sh -c` and `eval`
+  strings seen through) and counts only a beacon invocation in command position, so
+  `grep 'beacon watch' README.md` or a commit message that names them stays allowed. The CLI
+  itself also refuses those four when any supervised-context marker is inherited
+  (`BEACON_RUN`, `BEACON_WATCHDOG` or `CLAUDECODE`) and stdin is not a terminal. Residual: a
+  process that clears all three markers and fakes a terminal (a pty of its own) gets past
+  both layers;
   the chat channel only sees prompts Claude Code submits for you (`beacon watch` skips it).
   These stop accidental or casual self-approval. They do not stop a determined process
   running as your user (it could fake a terminal or write the database with its own code):

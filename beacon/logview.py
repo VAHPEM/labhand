@@ -122,7 +122,8 @@ def sessions(run_dir):
     for e in entries:
         p, sid = e.get("transcript_path"), e.get("session")
         if p and sid and sid not in found:
-            found[sid] = {"session": sid, "path": os.path.expanduser(p), "kind": "transcript", "ts": e.get("ts", 0)}
+            path = os.path.expanduser(p)
+            found[sid] = {"session": sid, "path": path, "paths": [path], "kind": "transcript", "ts": e.get("ts", 0)}
     sdir = os.path.join(run_dir, "sessions")
     try:
         names = sorted(n for n in os.listdir(sdir) if n.endswith(".jsonl"))
@@ -136,10 +137,16 @@ def sessions(run_dir):
             if ev.get("session_id"):
                 sid = ev["session_id"]
                 break
-        if sid in found and found[sid]["kind"] == "transcript" and os.path.exists(found[sid]["path"]):
-            continue          # Claude Code's own file has everything the stream has
+        if sid in found and found[sid]["kind"] == "transcript":
+            if os.path.exists(found[sid]["path"]):
+                continue      # Claude Code's own file has everything the stream has
+            # Claude Code's file was moved or deleted: the stream file(s) stand in for it (B2: this entry had
+            # no "paths" and the append below raised KeyError, crashing the decider and the lighthouse).
+            found[sid] = {"session": sid, "path": path, "paths": [path], "kind": "stream",
+                          "ts": found[sid]["ts"] or os.path.getmtime(path)}
+            continue
         if sid in found:      # a resumed session: one stream file per `claude -p --resume`
-            found[sid]["paths"].append(path)
+            found[sid].setdefault("paths", [found[sid]["path"]]).append(path)
             continue
         found[sid] = {"session": sid, "path": path, "paths": [path], "kind": "stream",
                       "ts": os.path.getmtime(path)}

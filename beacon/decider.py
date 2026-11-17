@@ -207,7 +207,11 @@ def decide(L, parent_id, question, option_ids, brief="", transport=None, key=Non
     if decisions_made(L) >= int(cfg.get("max_decider_calls", 0)):
         return dict(base, status="budget", detail=f"decider budget of {cfg.get('max_decider_calls')} calls spent")
     try:
-        obj, resp = call_json(cfg["decider_model"], system_prompt(cfg), build_prompt(L, parent_id, question, option_ids, brief, cfg),
+        prompt = build_prompt(L, parent_id, question, option_ids, brief, cfg)
+    except Exception as e:  # noqa: BLE001  -- B2: a broken session log must not crash ask(); the worker's order stands
+        return dict(base, status="error", detail=f"could not build the prompt: {type(e).__name__}: {e}"[:300])
+    try:
+        obj, resp = call_json(cfg["decider_model"], system_prompt(cfg), prompt,
                               schema=SCHEMA, max_tokens=int(cfg["decider_max_tokens"]),
                               effort=cfg.get("decider_effort"), timeout=int(cfg["decider_timeout"]),
                               transport=transport, key=key)

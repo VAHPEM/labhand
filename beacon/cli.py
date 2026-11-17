@@ -100,6 +100,38 @@ def _require_terminal(action):
                           "(stdin is not a TTY). It cannot be run by the worker or from a pipe.")
 
 
+# A process with any of these set runs inside a supervised / Claude Code session (the same set as ccbridge's
+# orch_base.refuse_inside_worker): the watchdog sets the first two for its session, Claude Code sets CLAUDECODE
+# for every tool and subprocess it starts. Clearing one is not enough to slip past (review P4).
+SUPERVISED_MARKERS = ("BEACON_RUN", "BEACON_WATCHDOG", "CLAUDECODE")
+
+
+def _refuse_nested_session(args):
+    """`claude` / `watch` / `demo` / `eval` start (or set up) Claude Code sessions. Run inside a supervised
+    session (any of SUPERVISED_MARKERS inherited, and no terminal: the worker's Bash tool, a subagent, a pipe)
+    that would be a nested supervised session that inherits the run and possibly bypassPermissions. The guard
+    refuses the shell spellings; this refuses every spelling that reaches the CLI, including a worker that
+    imports beacon.cli and pops one marker. A human in a terminal and the orchestrator (it starts
+    `watch --run RUN` from outside Claude Code, none of the markers set) are unaffected. Residual: a process
+    that clears all three and fakes a TTY is not stopped (README, "The human's channel")."""
+    from .hooks import NESTED_SESSION_COMMANDS
+    if args.cmd not in NESTED_SESSION_COMMANDS:
+        return
+    marker = next((v for v in SUPERVISED_MARKERS if os.environ.get(v, "").strip()), None)
+    if marker is None:
+        return
+    try:
+        tty = sys.stdin is not None and sys.stdin.isatty()
+    except (ValueError, OSError):                  # a closed stdin is not a terminal
+        tty = False
+    if tty:
+        return
+    raise LedgerError(f"`beacon {args.cmd}` starts a Claude Code session and was called from inside a supervised "
+                      f"one ({marker} is set and stdin is not a TTY): refused. A worker uses the Agent tool for a "
+                      "subagent; a human runs it from a terminal outside Claude Code (no BEACON_RUN / "
+                      "BEACON_WATCHDOG / CLAUDECODE) and passes --run.")
+
+
 def _open(args):
     run = args.run or os.environ.get("BEACON_RUN", "").strip()
     if not run:
@@ -597,6 +629,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
+        _refuse_nested_session(args)
         rc = args.fn(args)
     except LedgerError as e:
         print(f"error: {e}", file=sys.stderr)

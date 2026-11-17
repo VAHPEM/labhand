@@ -49,6 +49,7 @@ import shutil
 import stat
 import subprocess
 
+from .hooks import HUMAN_COMMANDS
 from .shellrun import posix_path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -63,8 +64,7 @@ PROTECT_DENY = ("Edit(**/ledger.db*)", "Bash(sqlite3 *)", "Edit(**/.claude/setti
                 "Edit(**/.claude/beacon-setup.json)",
                 # agent definitions: one can carry `permissionMode: bypassPermissions` for the subagent it starts
                 "Edit(**/.claude/agents/**)", "Edit(~/.claude/agents/**)") + tuple(
-    f"Bash(.claude/beacon {c} *)" for c in ("answer", "verify", "set-verify", "reopen", "config", "lighthouse",
-                                            "init", "setup-project", "teardown-project"))
+    f"Bash(.claude/beacon {c} *)" for c in HUMAN_COMMANDS)      # the guard's single list (hooks.py)
 WRAPPER = """#!/bin/sh
 # beacon, for `! .claude/beacon ...` in the Claude Code chat (and any terminal in this project).
 # Written by `beacon setup-project`. The commands that act as the human (answer, verify, ...) need a terminal.

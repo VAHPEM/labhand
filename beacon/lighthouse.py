@@ -345,17 +345,33 @@ SCHEMA = obj_schema({"suggestions": {"type": "array", "items": _SUGGESTION},
                      "review": _str("step-back instruction for the worker"), "notes": _str()})
 
 
-def run_lighthouse(L, task="stall", focus=(), cfg=None, transport=None, key=None):
+def run_lighthouse(L, task="stall", focus=(), cfg=None, transport=None, key=None, on_prompt=None):
     """Returns {"status", "added": [ids], "added_desc": [...], "detail"}.
-    status: ok | empty | unavailable | refusal | error."""
+    status: ok | empty | unavailable | refusal | error.
+
+    on_prompt: called once the request is going ahead (the prompt is built, or no key makes it unavailable),
+    before the model call. The gate takes the human's one-shot review request there: a prompt that cannot be
+    built (a session log that cannot be read) leaves the request for the next stop instead of losing it, and
+    a request whose model call was made is never repeated."""
     cfg = cfg or L.config()
     key = key or load_key()
     if not key and transport is None:
+        if on_prompt:
+            on_prompt()
         res = {"status": "unavailable", "added": [], "detail": "no API key (BEACON_API_KEY / ANTHROPIC_API_KEY)"}
         L.record("lighthouse", {"task": task, **res}, actor="lighthouse")
         return res
     try:
-        obj, resp = call_json(cfg["lighthouse_model"], SYSTEM, build_prompt(L, task, focus, cfg), schema=SCHEMA,
+        prompt = build_prompt(L, task, focus, cfg)
+    except Exception as e:  # noqa: BLE001  -- B2: a broken session log degrades to a dry round, never a crash
+        res = {"status": "error", "added": [], "prompt_failed": True,
+               "detail": f"could not build the prompt: {type(e).__name__}: {e}"[:300]}
+        L.record("lighthouse", {"task": task, **res}, actor="lighthouse")
+        return res
+    if on_prompt:
+        on_prompt()
+    try:
+        obj, resp = call_json(cfg["lighthouse_model"], SYSTEM, prompt, schema=SCHEMA,
                               max_tokens=int(cfg["lighthouse_max_tokens"]), effort=cfg.get("lighthouse_effort"),
                               timeout=int(cfg["lighthouse_timeout"]), transport=transport, key=key,
                               deadline=cfg.get("_deadline"))

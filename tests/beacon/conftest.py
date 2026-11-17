@@ -17,6 +17,15 @@ def _no_real_api(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _not_inside_a_supervised_session(monkeypatch):
+    """The suite may itself run inside a beacon-supervised session (a worker running pytest): the run it
+    inherits is not the tests' run, and the CLI refuses session-starting commands under any of its markers
+    (CLAUDECODE: pytest started from Claude Code's Bash tool)."""
+    for var in ("BEACON_RUN", "BEACON_WATCHDOG", "CLAUDECODE"):
+        monkeypatch.delenv(var, raising=False)
+
+
 # The production default is no model calls at all (Ve, 2026-11-15: the orchestrator is beacon's lighthouse,
 # decider and classifier). The model paths are still tested against mock transports, so the suite gives them
 # the budgets they had; test_no_model_calls.py (marker real_defaults) checks the real defaults.

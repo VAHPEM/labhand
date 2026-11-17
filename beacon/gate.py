@@ -475,10 +475,32 @@ def on_stop(L, inp, lighthouse=None, now=None, classifier=None, rotate=False, fo
         # The human asked for a review (`beacon: lighthouse`): it runs now, outside the budget -- before the
         # finished-run and awaiting-human checks (measured 2026-11-13: asked while the run waited on the human,
         # and again after every problem was closed, the review never ran). What it queues reopens the work.
-        L.take_human_flag("lighthouse_request")
+        # B2: the request is taken only once the review is going ahead (its prompt built), not before: a prompt
+        # that cannot be built (an unreadable session log) keeps the request for the next stop instead of losing
+        # it, and such a failure degrades to a dry round rather than crashing the stop (which fails open).
         note = str((asked_for or {}).get("note") or "").strip()
-        res = lighthouse(L, task="human", focus=[note] if note else [], cfg=cfg) or {}
-        g["lighthouse_calls"] += 1
+        try:
+            takes_hook = "on_prompt" in inspect.signature(lighthouse).parameters
+        except (TypeError, ValueError):
+            takes_hook = False
+        went_ahead = [not takes_hook]
+
+        def _going_ahead():
+            went_ahead[0] = True
+            L.take_human_flag("lighthouse_request")
+
+        kwargs = {"on_prompt": _going_ahead} if takes_hook else {}
+        if not takes_hook:
+            L.take_human_flag("lighthouse_request")        # a lighthouse without the hook: taken up front, as before
+        try:
+            res = lighthouse(L, task="human", focus=[note] if note else [], cfg=cfg, **kwargs) or {}
+        except Exception as e:  # noqa: BLE001
+            res = {"status": "error", "added": [], "detail": f"lighthouse failed: {type(e).__name__}: {e}"[:300]}
+        # Review P5: the budget counts reviews that went ahead. A prompt that could not be built made no model
+        # call and kept the request; counting it pushed lighthouse_calls past max_lighthouse_calls and so turned
+        # the automatic stall/idle lighthouse off with zero calls made.
+        if went_ahead[0] and not res.get("prompt_failed"):
+            g["lighthouse_calls"] += 1
         lh = dict(res, requested_by="human")
         if res.get("added"):
             g["lighthouse_dry"], g["stall"], g["idle"] = 0, 0, 0
@@ -578,7 +600,8 @@ def on_stop(L, inp, lighthouse=None, now=None, classifier=None, rotate=False, fo
                 "The worker is stuck and the lighthouse budget is spent (or no lighthouse is configured)."))
         task = "audit_near_done" if audit else ("idle" if g["idle"] >= int(cfg["k_idle"]) else "stall")
         res = lighthouse(L, task=task, focus=audit, cfg=cfg) or {}
-        g["lighthouse_calls"] += 1
+        if not res.get("prompt_failed"):                    # no prompt, no model call: not a spent review (P5)
+            g["lighthouse_calls"] += 1
         if audit:
             g["audited"] = dict(g.get("audited", {}) or {})
             for nid in audit:

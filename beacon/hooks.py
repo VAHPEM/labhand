@@ -39,11 +39,258 @@ SCHEDULE_TOOLS = ("CronCreate", "ScheduleWakeup")
 NESTED_CLAUDE = re.compile(r"(?:^|[;&|(`]\s*|\$\(\s*|\b(?:exec|nohup|xargs|npx|sudo)\s+|\benv\s+(?:\S+=\S*\s+)*"
                            r"|\btimeout\s+\S+\s+)(?:\S*/)?claude(?=\s|$|[;&|)`])")
 OWN_TOOL_PREFIX = "mcp__beacon__"
-# The CLI's human-side commands. The worker could otherwise verify its own candidate, answer its
-# own questions, or set notify_cmd (a shell command the hooks run) through Bash.
-HUMAN_CLI = re.compile(r"(?:-m\s+beacon(?:\.cli)?|\bbeacon(?:\.cli)?(?:\s|$)|/beacon\s)\s*"
-                       r"(?:--run\s+\S+\s+)?(answer|verify|set-verify|reopen|config|lighthouse|init|"
-                       r"setup-project|teardown-project)\b")
+# THE classification of every `beacon` CLI subcommand (one source of truth): the PreToolUse guard's regex
+# and message below, setup-project's deny rules (project.PROTECT_DENY) and the CLI's own worker-context
+# refusal (cli.main) are all built from these. tests/beacon check that every subcommand of cli.build_parser
+# is in exactly one of HUMAN_COMMANDS / WORKER_COMMANDS.
+# Human-only: the worker could otherwise verify its own candidate, answer its own questions, set notify_cmd
+# (a shell command the hooks run), or start a nested supervised Claude Code (claude / watch / demo / eval),
+# which inherits the run and possibly a bypassPermissions mode.
+HUMAN_COMMANDS = ("answer", "verify", "set-verify", "reopen", "config", "lighthouse", "init",
+                  "setup-project", "teardown-project", "claude", "watch", "demo", "eval")
+# Read-only views the worker may run from Bash.
+WORKER_COMMANDS = ("status", "report", "graph", "check", "hooks-config", "log", "transcript",
+                   "calibrate-refusals", "doctor")
+# The human commands that start a Claude Code session: also refused by the CLI itself when it runs inside a
+# supervised session (inherited BEACON_RUN, stdin not a TTY), so even an invocation the regex misses is blocked.
+NESTED_SESSION_COMMANDS = ("claude", "watch", "demo", "eval")
+
+
+# ---- the Bash guard's view of a command line: shell words, not raw text (review P4) ----
+# Matching raw text missed `.claude/beacon 'claude'`, `python3 -mbeacon watch`, `beacon -- watch`, a repeated
+# `--run X`, `beacon${IFS}watch`; it also blocked ordinary commands that merely mention the words
+# (`grep 'beacon watch' README.md`). So the command is split into shell words (quotes and backslashes removed)
+# and simple commands (at ; & | ( ) ` and newlines), and only a beacon invocation in COMMAND POSITION counts.
+_BEACON_MODULES = ("beacon", "beacon.cli", "beacon.__main__")
+_PREFIX_WORDS = ("exec", "nohup", "sudo", "command", "builtin", "time", "nice", "caffeinate", "stdbuf", "doas",
+                 "setsid", "chronic")
+_SHELLS = ("sh", "bash", "zsh", "dash", "ksh", "fish")
+_PY_OPTS_WITH_ARG = ("-X", "-W", "-Q")
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _shell_words(cmd):
+    """The command's simple commands, each a list of shell words. Unparseable quoting falls back to
+    whitespace splitting with the quote characters dropped (a guard reads too much rather than too little)."""
+    text = re.sub(r"\$\{IFS\}|\$IFS\b", " ", cmd).replace("\r\n", "\n").replace("\\\n", " ")
+    text = text.replace("\r", "\n").replace("\n", " ; ")
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()`")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        toks = list(lex)
+    except ValueError:
+        toks = re.sub(r"[;&|()`]", lambda m: f" {m.group(0)} ", re.sub(r"[\"'\\]", "", text)).split()
+    segs, cur = [], []
+    for t in toks:
+        if t and all(ch in ";&|()`" for ch in t):
+            if cur:
+                segs.append(cur)
+            cur = []
+        else:
+            cur.append(t[1:] if t.startswith("$") and t[1:2] == "(" else t)
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+def _strip_prefixes(words):
+    """Drop what runs another command without being it: VAR=x, env [-i] [-u N] [VAR=x], nohup, sudo, timeout N,
+    xargs [opts], uv/poetry/pipenv run, ... Returns (words from the command word on, ran_through_xargs)."""
+    i, xargs = 0, False
+    while i < len(words):
+        w, base = words[i], os.path.basename(words[i])
+        if _ASSIGN.match(w):
+            i += 1
+        elif base == "env":
+            i += 1
+            while i < len(words) and (words[i].startswith("-") or _ASSIGN.match(words[i])):
+                i += 2 if words[i] in ("-u", "-C", "-S", "--unset", "--chdir") else 1
+        elif base in _PREFIX_WORDS:
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 2 if words[i] in ("-u", "-g", "-n", "-C", "-a", "-p", "-h") else 1
+        elif base in ("timeout", "gtimeout"):
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 2 if words[i] in ("-s", "-k", "--signal", "--kill-after") else 1
+            i += 1                                           # the duration
+        elif base == "script":                               # script [-adkpqr] [-F p] [-t t] file command...
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 2 if words[i] in ("-F", "-t", "-T", "-c", "-E", "-I", "-O", "-B") else 1
+            i += 1                                           # the typescript file
+        elif base == "xargs":
+            xargs, i = True, i + 1
+            while i < len(words) and words[i].startswith("-"):
+                i += 2 if words[i] in ("-I", "-n", "-P", "-L", "-d", "-E", "-s", "-J", "-R") else 1
+        elif base in ("uv", "poetry", "pipenv", "pdm", "hatch", "rye") and i + 1 < len(words) \
+                and words[i + 1] == "run":
+            i += 2
+        else:
+            break
+    return words[i:], xargs
+
+
+def _beacon_args(words):
+    """If `words` (from the command word on) invoke the beacon CLI, return the words after the CLI itself,
+    else None. Recognised: anything named `beacon` (.claude/beacon, a PATH entry), `python[3[.x]] [opts]
+    -m beacon[.cli|.__main__]` (also `-mbeacon`, `-Im beacon`), `python .../beacon/cli.py|__main__.py`."""
+    if not words:
+        return None
+    base = os.path.basename(words[0])
+    if base == "beacon":
+        return words[1:]
+    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?w?(?:\.exe)?|pypy3?", base):
+        return None
+    i = 1
+    while i < len(words):
+        w = words[i]
+        if w == "--":
+            i += 1
+            break
+        if w.startswith("--"):                               # --check-hash-based-pycs MODE, --help, ...
+            i += 2 if w == "--check-hash-based-pycs" else 1
+            continue
+        if w.startswith("-") and len(w) > 1:                 # a cluster of short options: -I, -Im, -mbeacon, -Xdev
+            for k, ch in enumerate(w[1:], 1):
+                rest = w[k + 1:]
+                if ch in "XW":                               # takes a value, attached or the next word
+                    i += 1 if rest else 2
+                    break
+                if ch == "m":
+                    mod = rest if rest else (words[i + 1] if i + 1 < len(words) else "")
+                    after = i + 1 if rest else i + 2
+                    return words[after:] if mod in _BEACON_MODULES else None
+                if ch == "c":
+                    return None
+            else:
+                i += 1
+            continue
+        break
+    if i < len(words):
+        norm = words[i].replace("\\", "/")
+        if re.search(r"(?:^|/)beacon(?:/(?:cli|__main__)\.py)?/?$", norm):
+            return words[i + 1:]
+    return None
+
+
+def _beacon_subcommand(rest):
+    """The subcommand argparse would see: skips `--`, `--run X`, `--run=X` (any number) and other options."""
+    i = 0
+    while i < len(rest):
+        w = rest[i]
+        if w == "--run":
+            i += 2
+        elif w.startswith("-"):
+            i += 1
+        else:
+            return w
+    return None
+
+
+def _python_c_code(words):
+    """The code of `python [opts] -c CODE` (also -Ic CODE, -cCODE), else None."""
+    if not words or not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?w?(?:\.exe)?|pypy3?", os.path.basename(words[0])):
+        return None
+    i = 1
+    while i < len(words):
+        w = words[i]
+        if w == "--" or not w.startswith("-") or len(w) < 2:
+            return None
+        if w.startswith("--"):
+            i += 1
+            continue
+        step = 1
+        for k, ch in enumerate(w[1:], 1):
+            rest = w[k + 1:]
+            if ch in "XW":
+                step = 1 if rest else 2
+                break
+            if ch == "m":
+                return None
+            if ch == "c":
+                return rest if rest else (words[i + 1] if i + 1 < len(words) else "")
+        i += step
+    return None
+
+
+def human_cli_hit(cmd, _depth=0):
+    """The human-only beacon subcommand `cmd` would run (from HUMAN_COMMANDS), else None."""
+    if _depth > 3:
+        return None
+    human = set(HUMAN_COMMANDS)
+    for seg in _shell_words(cmd):
+        words, xargs = _strip_prefixes(seg)
+        if not words:
+            continue
+        base = os.path.basename(words[0])
+        if base == "eval" and len(words) > 1:                     # the shell builtin: its arguments are a command
+            hit = human_cli_hit(" ".join(words[1:]), _depth + 1)
+            if hit:
+                return hit
+            continue
+        if base in _SHELLS:
+            j, script = 1, None
+            while j < len(words):
+                w = words[j]
+                if w.startswith("-") and not w.startswith("--") and "c" in w:     # sh -c STRING, bash -lc STRING
+                    hit = human_cli_hit(words[j + 1], _depth + 1) if j + 1 < len(words) else None
+                    if hit:
+                        return hit
+                    break
+                if w.startswith(("-", "+")):
+                    j += 2 if w in ("-o", "+o", "--rcfile", "--init-file") else 1
+                    continue
+                script = j                                       # sh .claude/beacon watch: the wrapper is a script
+                break
+            if script is None:
+                continue
+            words = words[script:]
+        code = _python_c_code(words)
+        if code is not None:                                     # python -c "...beacon.cli...main(['watch'])"
+            if "beacon" in code and re.search(r"\bcli\b|__main__|runpy|\bmain\b", code):
+                for c in HUMAN_COMMANDS:
+                    if re.search(r"""['"]""" + re.escape(c) + r"""['"]""", code):
+                        return c
+            continue
+        if words[0].startswith("$") and len(words) > 1 and words[1] in human:   # B=.claude/beacon; $B watch
+            return words[1]
+        rest = _beacon_args(words)
+        if rest is None:
+            continue
+        sub = _beacon_subcommand(rest)
+        if sub in human:
+            return sub
+        if xargs and sub not in WORKER_COMMANDS:                 # echo watch | xargs .claude/beacon [{}]
+            return "(subcommand from xargs)"
+    return None
+
+
+class _HumanCli:
+    """HUMAN_CLI.search(cmd): truthy when `cmd` runs a human-only beacon subcommand (kept as the guard's
+    historic interface; built from HUMAN_COMMANDS like everything else)."""
+
+    @staticmethod
+    def search(cmd):
+        return human_cli_hit(str(cmd))
+
+
+HUMAN_CLI = _HumanCli()
+
+
+def _claude_in_command_position(cmd):
+    for seg in _shell_words(cmd):
+        words, _ = _strip_prefixes(seg)
+        if words and os.path.basename(words[0]) == "claude":
+            return True
+        if words and os.path.basename(words[0]) == "npx" and len(words) > 1 and \
+                os.path.basename(words[1]) == "claude":
+            return True
+    return False
+
+HUMAN_ONLY_MESSAGE = ("That beacon command is for the human (" + ", ".join(HUMAN_COMMANDS) + "). Use the beacon "
+                      "tools; ask() if you need the human. A subagent is the Agent tool, not a nested session.")
 WEB_TOOLS = ("WebSearch", "WebFetch")
 # under .claude/; beacon-setup.json is setup's record of what it added (teardown removes exactly that)
 PROTECTED_NAMES = ("settings.json", "settings.local.json", "beacon-setup.json")
@@ -728,9 +975,8 @@ def guard(tool, tool_input, roots, cfg, agent_id=None, cwd=None):
     if tool == "Bash":
         cmd = str(ti.get("command", ""))
         if HUMAN_CLI.search(cmd):
-            return ("That beacon command is for the human (answer, verify, set-verify, reopen, config, lighthouse, "
-                    "init, setup-project, teardown-project). Use the beacon tools; ask() if you need the human.")
-        if NESTED_CLAUDE.search(cmd):
+            return HUMAN_ONLY_MESSAGE
+        if NESTED_CLAUDE.search(cmd) or _claude_in_command_position(cmd):
             return ("Starting another Claude Code session is disabled during a beacon run; use the Agent tool "
                     "for a subagent.")
         if bash_writes_agent_definition(cmd, cwd):
