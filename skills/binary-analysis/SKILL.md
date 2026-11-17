@@ -44,16 +44,28 @@ Early, cheap, and before any deep reading of an unknown sample:
   rules and addresses). Read the MITRE ATT&CK / MBC mapping **yourself**: it is a
   list of rule hits with evidence locations, not a verdict - confirm the interesting
   ones at their addresses (R1: a capa hit is an ASSUMED capability until you see it).
+  **On this lab capa is pip/pipx-installed and bundles no rules:** call it as
+  `linux.linux_capa("sample.exe", extra="-r ~/capa-rules")` (combine flags:
+  `extra="-r ~/capa-rules -j"`). A bare call returns a raw `ok=False` "default embedded rules not
+  found" - expected; add `-r ~/capa-rules`, do not read it as "capa broken".
+  **capa targets x86 / x86-64:** an aarch64 (ARM64) binary - e.g. one built on the
+  ARM64 Kali VM - comes back as `arch: unknown` and "no capabilities found", which says
+  nothing about the sample. For a real capability map use an x86-64 build/sample (e.g.
+  via the lab's x86_64 container), not an ARM64 Kali binary.
 - **Detection / rule generation:** `linux.linux_yara("rules.yar", "sample.exe")`
   (`extra="-s"` shows the matching strings, `-r` recurses a directory). Write and
-  test your own rules the same way; YARA-X (`yr scan rules.yar sample`) through
-  `shell.run_cmd` when it is installed.
+  test your own rules the same way. YARA-X: `linux.linux_yara("rules.yar",
+  "sample.exe", engine="yarax")` runs the `yr` CLI; the default `engine="yara"` runs
+  classic YARA. Which engine to use and what a match means is your call.
 - **Identity and clustering:** ssdeep / TLSH (fuzzy hashes), imphash and the
   Rich-header hash (PE: `python3 -c` with `pefile`) via `shell.run_cmd` /
   `shell.run_script` - they say "same family / same build environment" as a
   measurement to compare, never as a name (R7 still applies: hash the exact copy).
-- **Memory:** when a memory dump exists, Volatility 3 (`vol -f mem.raw windows.pslist`,
-  `windows.malfind`, ...) through `shell.run_cmd`, long plugins as `jobs.job_start`.
+- **Memory:** when a memory dump exists, Volatility 3 through
+  `linux.linux_vol(image, plugin, extra="")`, e.g. `linux.linux_vol("mem.raw",
+  "linux.pslist.PsList")` or `linux.linux_vol("mem.raw", "windows.malfind.Malfind")`
+  (raise `timeout=` for slow plugins; very long runs as `jobs.job_start`). Raw output
+  only - reading the process list and artefacts is the analyst's job.
 
 labhand only **runs** these tools and returns their raw output; the reading, the
 capability summary and any verdict are the analyst's. A tool missing on the VM comes

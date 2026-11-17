@@ -45,12 +45,18 @@ on the Kali VM through `labhand`.
 ## Capability triage first (when the target is an unknown sample)
 
 Before hunting bugs in an unknown or possibly malicious binary, get a capability map:
-`linux.linux_capa("target")` runs `capa` on the Kali VM; `linux.linux_yara("rules.yar",
-"target")` runs YARA (or YARA-X `yr scan` through `shell.run_cmd`) for detection and for
-testing rules you write; ssdeep / TLSH / imphash / Rich-header hashes via `shell.run_cmd`
-for identity and sample clustering; Volatility 3 through `shell.run_cmd` when a memory
-dump exists. labhand only **runs** these and returns their raw output: interpret the MITRE
-ATT&CK / MBC mapping and draw any verdict **yourself** - a capa hit points at where to
+`linux.linux_capa("target", extra="-r ~/capa-rules")` runs `capa` on the Kali VM;
+`linux.linux_yara("rules.yar", "target")` runs YARA (`engine="yarax"` runs YARA-X's `yr`
+instead) for detection and for testing rules you write; ssdeep / TLSH / imphash /
+Rich-header hashes via `shell.run_cmd` for identity and sample clustering; Volatility 3
+through `linux.linux_vol(image, plugin, extra="")` (e.g. `linux.linux_vol("mem.raw",
+"linux.pslist.PsList")`) when a memory dump exists. Lab specifics: capa here is
+pip/pipx-installed with no bundled rules, so always pass `-r ~/capa-rules` (a bare call
+gives a raw `ok=False` "default embedded rules not found" - expected); capa targets x86 /
+x86-64, so an aarch64 (ARM64 Kali) binary yields `arch: unknown` / "no capabilities
+found" - use an x86-64 sample (e.g. via the lab's x86_64 container) for a real map.
+labhand only **runs** these and returns their raw output: interpret the MITRE ATT&CK /
+MBC mapping and draw any verdict **yourself** - a capa hit points at where to
 look (parsers, network input, unpacking) and is an assumption until measured. A tool
 missing on the VM returns its raw error; labhand does not auto-install it (install hints:
 `pipx install flare-capa`, `apt install yara`, `pip install volatility3`).
