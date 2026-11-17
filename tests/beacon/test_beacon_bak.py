@@ -365,7 +365,7 @@ def test_beacon_bak_ownfile_foreign_command_file_is_left_alone(tmp_path):
     (proj / ".claude" / "beacon").write_bytes(b"#!/bin/sh\necho mine\n")
     changes = teardown_project(str(proj))
     assert (proj / ".claude" / "beacon").read_bytes() == b"#!/bin/sh\necho mine\n"
-    assert not any(c.startswith(".claude/beacon") for c in changes)
+    assert not any(c.startswith(".claude/beacon:") for c in changes)
     assert _baks(proj) == []
 
 

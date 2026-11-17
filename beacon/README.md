@@ -92,11 +92,33 @@ the PreToolUse guard refuses them from the worker's Bash; no MCP tool reaches th
 `beacon teardown-project DIR` is the inverse of `setup-project`. It removes:
 
 - the worker-rules block between its markers in `CLAUDE.md`;
-- beacon's hooks, its `mcp__beacon` allow rule and its deny rules in `.claude/settings.json` and
-  `.claude/settings.local.json`;
-- the beacon server in `.mcp.json`;
+- the hooks, allow rules (`mcp__beacon`, `mcp__labhand`) and deny rules `setup-project` added to
+  `.claude/settings.json` / `.claude/settings.local.json`, the `respondToBashCommands` it set, and the
+  `mcp__beacon__*` approvals and `enabledMcpjsonServers` entry the run added;
+- the beacon server in `.mcp.json`, when setup added it;
 - `.claude/beacon`, when it is beacon's own command (by content); any other file there is the
-  project's and stays untouched (one setup replaced is put back from its backup).
+  project's and stays untouched (one setup replaced is put back from its backup);
+- `.claude/beacon-setup.json`, setup's record (last, so an interrupted teardown can be run again).
+
+**What you had stays.** Setup records in `.claude/beacon-setup.json` what it added because it was
+absent: per settings file the hook events, allow / deny rules and keys, whether `beacon` was already in
+`enabledMcpjsonServers` and which `mcp__beacon__*` approvals already existed; for `.mcp.json` whether it
+added the beacon server or replaced yours. It writes the record before any wired file, so an
+interrupted setup leaves a record that covers whatever it got to; a re-run (an interrupted run, a moved
+checkout) keeps what the earlier record says and adds only what is new. An entry whose file no longer
+holds everything it lists is stale (an interrupted setup that never reached the file, an interrupted
+teardown that already stripped it) and is replaced by what this setup finds: a rule you added since
+stays yours. The cost of that rule: if one of beacon's parts was removed by hand during a run and setup
+is run again, the beacon parts still there count as yours and teardown leaves them (rules left
+behind, never a rule of yours removed). Teardown removes exactly what
+the record lists: a deny rule such as `Edit(~/.claude/agents/**)` or `Bash(sqlite3 *)`, an allow rule, a
+beacon hook or a beacon MCP server you had before setup stays, and a beacon hook or server entry setup
+rewrote (paths may have moved) gets your old value back; teardown names each part it kept ("kept denied
+… (it was there before setup)"). A project wired by a setup older than the record (no record, the wired
+file still there) is judged from that setup's `.beacon-bak` (its pre-run state) on the next setup; with
+no record at teardown either, every beacon part is removed as before. A record that is not one is an
+error to fix by hand, never guessed around. The record is protected like the settings files (deny rule
+`Edit(**/.claude/beacon-setup.json)`, and the guard refuses Write/Edit/Bash on it).
 
 Everything else stays. A file setup created that is left with nothing in it is removed; a file that
 held only an empty object or empty text before setup is put back. A file that is back to its
@@ -125,9 +147,9 @@ that differs from the (unwired) file is from an older run; it is moved aside to 
 A backup equal to the file is reused; a file still wired (an interrupted run) keeps its backup.
 A `.claude/beacon.beacon-bak` that holds a beacon wrapper (left by an older version) is not a copy of
 anything the project owns: setup and teardown remove it, and it never stands in for the project's file.
-An `mcp__labhand` allow rule is kept and reported: `setup-project
---allow-labhand` adds it, but the project may have had it before. `--dry-run` shows what would
-change. The real run needs a terminal and is refused from the worker's Bash.
+An `mcp__labhand` allow rule `setup-project --allow-labhand` added is removed; one the project had
+before stays (without a record: kept and reported, since it may have been the project's). `--dry-run`
+shows what would change. The real run needs a terminal and is refused from the worker's Bash.
 
 ### Running beacon on a repo that contains beacon
 
@@ -375,9 +397,27 @@ python3 -m beacon watch --run ~/beacon-runs/fo13 --cwd ~/ctf/fo13          # run
   for a subagent's call; a session started with an agent option has `agent_type` alone and is the
   main session). Agent definitions are off-limits too: one can carry `permissionMode:
   bypassPermissions` for the subagent it starts, so `setup-project` adds the deny rules
-  `Edit(**/.claude/agents/**)` and `Edit(~/.claude/agents/**)` (teardown removes them with the
-  others), and the guard refuses a Write/Edit into any `.claude/agents` directory (case-insensitive,
-  through symlinks) and a Bash command or another MCP server's call that names `.claude/agents`. On a failed integrity check the gate writes nothing (a new event
+  `Edit(**/.claude/agents/**)` and `Edit(~/.claude/agents/**)` (teardown removes them unless you had
+  them before setup), and the guard refuses writes there by every route it can recognise. A path counts
+  only when a whole `.claude` component is followed by a whole `agents` component, after `~`, `abspath`
+  (`./`, `//`, `..`) and resolving the symlinks of its existing prefix, case-insensitively
+  (`.claude/agents-notes.md` or `~/.claude/agentsX` do not count), and only writes are refused: reading
+  an agent file is allowed. Write/Edit/NotebookEdit: the file path. Another MCP server's tool: any tool
+  not named like a read (`read_*`, `get_*`, `list_*`, `search_*`, ...) with a path value there, or a
+  command value that writes there. Bash is parsed (shlex), not grepped: redirections, `tee`,
+  `cp`/`mv`/`ln`/`install`/`rsync` targets (a recursive copy or a move onto a `.claude` directory too),
+  `rm`/`touch`/`mkdir`/`chmod`/... operands, `dd of=`, `sed -i`/`perl -i`, editors, `curl -o`,
+  `wget`, `tar -C`, `unzip -d`, `git checkout|restore|rm|...`, `find -delete|-exec`, and
+  `python|perl|node|... -c/-e` code (or a heredoc fed to one) that names an agent path and writes;
+  followed through `cd` within the command (and the hook's `cwd`), variables the command assigns or the
+  environment holds, `for` loop variables, globs and brace lists, quoting, `$(...)`, backticks,
+  `bash -c`, `eval`, `sudo`/`env`/`xargs` prefixes and heredocs fed to a shell. Shell parsing cannot be
+  complete, and these are not recognised: a script file run by an interpreter, a computed variable
+  holding several components, a program not listed writing into the current directory, hard links, an
+  MCP server rooted inside `.claude` given a path relative to it. An unknown variable stands for one
+  unknown component (`$X/agents/x` is refused), and a command that does not parse is refused when it
+  names `.claude` next to `agents`. The deny rules still cover the built-in Edit/Write tools whatever
+  the guard misses, and Claude Code's auto-mode classifier is another layer. On a failed integrity check the gate writes nothing (a new event
   would re-seal the tampered state) and stops with a loud report.
 - **No model calls by default (since 2026-11-15).** `max_lighthouse_calls`, `max_decider_calls`,
   `max_classifier_calls` and `max_followup_calls` default to 0: a stall stops the run for the human (or the

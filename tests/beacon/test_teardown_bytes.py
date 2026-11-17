@@ -184,7 +184,8 @@ def test_teardown_roundtrip_project_own_claude_beacon_is_restored(tmp_path):
 def test_teardown_roundtrip_fresh_project_files_removed(tmp_path):
     proj = _proj(tmp_path)
     _setup(proj)
-    assert set(_state(proj)) == {"CLAUDE.md", ".mcp.json", ".claude/settings.local.json", ".claude/beacon"}
+    assert set(_state(proj)) == {"CLAUDE.md", ".mcp.json", ".claude/settings.local.json", ".claude/beacon",
+                                 ".claude/beacon-setup.json"}
     teardown_project(str(proj))
     assert _state(proj) == {}
 
