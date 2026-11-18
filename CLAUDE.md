@@ -136,6 +136,34 @@ and the `win_*` GUI tools need that logon.
 | `job_start(name, command=None, script=None, host=None, python=None, truncated=False)` | start work in the background, return immediately with a pid. |
 | `job_poll(name=None, tail=40, grep=None, stop=False, host=None)` | check / tail / `grep` / `stop` a job (omit `name` to list all). |
 
+### Mac host — Cua Driver behind the `labhand-mac` MCP server
+The lab Mac itself (observe windows, click, type, scroll, drag, menus, clipboard; in the
+background) is driven by **Cua Driver** (trycua/cua, MIT) pinned to `cua-driver-rs-v0.53.2`,
+not by labhand's Python code. Full guide: `docs/MAC-HOST.md`; worker skill: `mac-host`.
+- **Getting it:** ccbridge `--allow-mac` + the exclusive resource `mac-desktop`; beacon adds a
+  project MCP server `labhand-mac` = `LABHAND_MAC_MCP_COMMAND` (JSON argv) or
+  `~/.local/bin/cua-driver mcp`. Tools appear as `mcp__labhand-mac__<tool>`
+  (`get_window_state`, `click`, `type_text`, `set_value`, `press_key`, `hotkey`, `scroll`,
+  `drag`, `launch_app`, `invoke_menu`, `list_apps`, `list_windows`, `clipboard_read/_write`, …).
+- **Token tips:** the full `tools/list` is 61 tools / 41,242 cl100k; load only the schemas you
+  need (`ToolSearch select:mcp__labhand-mac__get_window_state,…`; the 14 core tools = 14,796).
+  `cua-driver mcp` cannot filter its list (a user policy can, but only in `--direct` or a
+  private daemon: docs/MAC-HOST.md §4). Observe with `include_screenshot:false`, narrow with
+  `query` / `max_elements`, re-read with `since:"latest"`; the tree is repeated in
+  `structuredContent`, so a result is ~2x its text.
+- **Permissions:** CuaDriver.app's daemon holds Accessibility + Screen Recording and
+  `cua-driver mcp` proxies to it. Residual (Ve's choice): `/usr/local/bin/node` (Desktop
+  Commander, responsible process of every ccbridge worker) also holds Accessibility + Screen
+  Recording + PostEvent, so any process under Desktop Commander can drive the Mac;
+  `--allow-mac` picks who gets the tools, it is **not** an OS boundary.
+- **Install / update:** only `python scripts/install_cua_driver.py` (pinned SHA256, signature
+  `com.trycua.driver` / team `YCK386LBJ7`, spctl, idempotent); `--check` is a read-only report.
+  Telemetry is off (persisted); never run `cua-driver update`.
+- **Gate (measured 2026-11-18, `~/.ccbridge/reviews/mac-gate/GATE.md`):** tree-only observation
+  1.1k-2.3k tokens of text per window; MCP medians observe 44 ms, type 20 chars 411 ms, pixel
+  click 696 ms; element click on TextEdit's text area fails (AXPress -25206) while `type_text`
+  by element works; cursor and frontmost app never changed.
+
 ## MCP server — expose the Muscle to any MCP client
 
 ```bash
@@ -178,12 +206,16 @@ The server registers as `labhand`. See `labhand/mcp_server.py`.
 
 `skills/`: the agent skills, one `skills/<name>/SKILL.md` each — the **single source**,
 hand-edited markdown (`binary-analysis`: the analysis discipline R1-R10 and technique
-notes; `vuln-research`: memory-safety triage). `python skills/sync.py` copies them to
+notes; `vuln-research`: memory-safety triage; `mac-host`: driving the lab Mac through
+`labhand-mac` token-efficiently). `python skills/sync.py` copies them to
 `.claude/skills/` (generated but committed, so a fresh clone has the project skills;
 `tests/test_skills.py` fails if it drifts from `skills/`; `--dest DIR` for other skill
 dirs, `--check` reports drift). Never edit the copies.
 
-`docs/`: `LAB-ISOLATION.md` (the lab's network boundary).
+`docs/`: `LAB-ISOLATION.md` (the lab's network boundary), `MAC-HOST.md` (the Mac host:
+Cua Driver install / check, permissions, MCP tool budget, `LABHAND_MAC_MCP_COMMAND`).
+
+`scripts/`: `install_cua_driver.py` (pinned Cua Driver installer / `--check`; stdlib only).
 
 `tests/`: VM-free unit tests (`pytest`). License: Apache-2.0.
 
