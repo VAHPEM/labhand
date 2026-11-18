@@ -5,7 +5,8 @@ Writes, inside DIR only (apart from the target of a symlinked file, below), merg
   .claude/settings.local.json   the five hooks + an allow rule for the beacon MCP tools
                                 (settings.json instead with --shared; the hook commands
                                 carry absolute paths of this machine, hence "local")
-  .mcp.json                     the beacon MCP server entry
+  .mcp.json                     the beacon MCP server entry (and, with --allow-mac, the labhand-mac
+                                server, enabled in enabledMcpjsonServers and allowed as mcp__labhand-mac)
   CLAUDE.md                     the worker rules (beacon/WORKER.md) between markers,
                                 replaced in place on a re-run
   .claude/beacon-setup.json     setup's record of what it added because it was absent (written
@@ -164,6 +165,74 @@ def merge_mcp(cfg, mcp_python, repo=REPO):
     return c, [change]
 
 
+# The Mac-control server (`--allow-mac`): never at user scope (it would be in every session), only in the
+# .mcp.json of a project setup was asked to give it to. It is an existing engine registered under the name
+# labhand-mac: $LABHAND_MAC_MCP_COMMAND, else Cua Driver's MCP mode (`cua-driver mcp`, which proxies to the
+# CuaDriver.app daemon that holds the macOS permissions).
+MAC_SERVER = "labhand-mac"
+MAC_ALLOW = "mcp__labhand-mac"
+LABHAND_ALLOW = "mcp__labhand"
+MAC_COMMAND_ENV = "LABHAND_MAC_MCP_COMMAND"
+MAC_DEFAULT_COMMAND = ("~/.local/bin/cua-driver", "mcp")
+# servers setup adds beside `beacon` (each recorded under the .mcp.json entry's "servers")
+EXTRA_SERVERS = (MAC_SERVER,)
+
+
+class MacCommandError(ValueError):
+    """$LABHAND_MAC_MCP_COMMAND is malformed (setup refuses it before writing anything)."""
+
+
+def mac_command():
+    """The labhand-mac server's argv: $LABHAND_MAC_MCP_COMMAND (a JSON array of strings: the program, then its
+    args) when set, else `~/.local/bin/cua-driver mcp`. A program given as a path (with `~` or a separator) is
+    made absolute (Claude Code spawns it without a shell, from the project's directory); a bare name stays,
+    for a PATH lookup. Raises MacCommandError for a malformed value."""
+    raw = os.environ.get(MAC_COMMAND_ENV, "").strip()
+    if not raw:
+        argv = list(MAC_DEFAULT_COMMAND)
+    else:
+        try:
+            argv = json.loads(raw)
+        except ValueError as e:
+            raise MacCommandError(f"${MAC_COMMAND_ENV} is not valid JSON ({e}); expected a JSON array, the program "
+                                  f'then its args, e.g. ["/path/to/engine", "mcp"]') from None
+        if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv) and argv[0].strip()):
+            raise MacCommandError(f"${MAC_COMMAND_ENV} must be a non-empty JSON array of strings, the program "
+                                  f'(non-empty) then its args, e.g. ["/path/to/engine", "mcp"]; got {raw!r}')
+    prog = argv[0]
+    if prog.startswith("~") or os.sep in prog or (os.altsep and os.altsep in prog):
+        prog = os.path.abspath(os.path.expanduser(prog))
+    return [prog] + argv[1:]
+
+
+def mac_server_entry(argv):
+    # no env at all, PYTHONPATH least of all: an inherited beacon home on PYTHONPATH once made the labhand
+    # server import the wrong copy of labhand (and see no hosts)
+    return {"command": argv[0], "args": list(argv[1:])}
+
+
+def merge_mac(cfg, settings, argv):
+    """Add the labhand-mac server to an .mcp.json object and enable it (enabledMcpjsonServers) in a settings
+    object, so Claude Code starts it without asking. -> (new_cfg, mcp changes, new_settings, settings changes)."""
+    c = json.loads(json.dumps(cfg or {}))
+    servers = c.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise ValueError(".mcp.json 'mcpServers' is not an object")
+    want, ch_mcp = mac_server_entry(argv), []
+    if servers.get(MAC_SERVER) != want:
+        ch_mcp.append(f"{'updated' if MAC_SERVER in servers else 'added'} {MAC_SERVER} MCP server")
+        servers[MAC_SERVER] = want
+    s = json.loads(json.dumps(settings or {}))
+    enabled = s.setdefault("enabledMcpjsonServers", [])
+    if not isinstance(enabled, list):
+        raise ValueError("settings enabledMcpjsonServers is not a list")
+    ch_s = []
+    if MAC_SERVER not in enabled:
+        enabled.append(MAC_SERVER)
+        ch_s.append(f"enabled {MAC_SERVER} in enabledMcpjsonServers")
+    return c, ch_mcp, s, ch_s
+
+
 def merge_claude_md(text, rules):
     block = f"{MARK_BEGIN}\n{rules.strip()}\n{MARK_END}"
     text = text or ""
@@ -308,12 +377,18 @@ def _write(path, content, dry_run, backup=True):
 
 
 def setup_project(project, python, mcp_python, shared=False, allow_labhand=False, dry_run=False,
-                  quiet_shell=False):
+                  quiet_shell=False, allow_mac=False):
+    """allow_mac: also add the labhand-mac server (Mac control) to the project's .mcp.json, enable it and allow
+    its tools. Its command ($LABHAND_MAC_MCP_COMMAND, else `cua-driver mcp`) is only written, never run here; a
+    malformed $LABHAND_MAC_MCP_COMMAND raises MacCommandError before anything is read or written."""
+    mac_argv = mac_command() if allow_mac else None      # a malformed override is refused before any write
     project = os.path.abspath(os.path.expanduser(project))
     if not os.path.isdir(project):
         raise FileNotFoundError(f"no such project directory: {project}")
     changes = []
     allow = ("mcp__beacon", "mcp__labhand") if allow_labhand else ("mcp__beacon",)
+    if allow_mac:
+        allow += (MAC_ALLOW,)
 
     sp = os.path.join(project, ".claude", "settings.json" if shared else "settings.local.json")
     other = os.path.join(project, ".claude", "settings.local.json" if shared else "settings.json")
@@ -325,18 +400,86 @@ def setup_project(project, python, mcp_python, shared=False, allow_labhand=False
         new["respondToBashCommands"] = False      # `! cmd` output lands in the chat without a model reply
         ch.append("set respondToBashCommands=false (shell-mode output gets no automatic reply)")
     new_mcp, ch_mcp = merge_mcp(m_before, mcp_python)
+    if allow_mac:
+        new_mcp, ch_m, new, ch_s = merge_mac(new_mcp, new, mac_argv)
+        ch_mcp += ch_m
+        ch += ch_s
+    o_new, ch_o = o_before, []
+    base = old_record
+    if not allow_mac and old_record and any(_mac_in_entry(n, e) for n, e in old_record["files"].items()):
+        # The grant follows the flag: a re-run without --allow-mac takes back exactly the labhand-mac parts an
+        # earlier setup recorded adding (a labhand-mac entry or approval the user had before stays theirs).
+        for path in (sp, other, mp):
+            name = os.path.basename(path)
+            entry = old_record["files"].get(name)
+            if not _mac_in_entry(name, entry):
+                continue
+            if path == mp:
+                sub = _extra_entries(entry)[MAC_SERVER]
+                if _server_holds(m_before, MAC_SERVER, sub):       # else stale: the file as it is is the user's
+                    new_mcp, c = strip_mcp(new_mcp, {"servers": {MAC_SERVER: sub}})
+                    ch_mcp += [f"{x} (no --allow-mac)" for x in c]
+            elif path == sp:
+                new, c = _strip_settings_recorded(new, _mac_settings_rec(entry, new))
+                ch += [f"{x} (no --allow-mac)" for x in c]
+            else:
+                o_new, c = _strip_settings_recorded(o_new, _mac_settings_rec(entry, o_new))
+                ch_o += [f"{x} (no --allow-mac)" for x in c]
+        base = {RECORD_KEY: 1, "files": {n: _without_mac(n, e) for n, e in old_record["files"].items()}}
+    # name -> the labhand-mac parts this run takes back (record form), kept recorded until the files are written
+    mac_src = dict(old_record["files"]) if base is not old_record else {}
+    legacy_mac = {}        # no record: name -> the labhand-mac parts an earlier setup added (record form)
+    if old_record is None:
+        # No record (deleted by hand, a lost write): beacon's own labhand-mac wiring is recognised as teardown
+        # recognises it (absent from setup's .beacon-bak, or a file setup created that holds nothing else);
+        # without --allow-mac it is taken back. A labhand-mac part the user had before setup stays theirs.
+        for path, cur in ((sp, s_before), (other, o_before), (mp, m_before)):
+            plain, beacon_parts = (strip_mcp if path == mp else strip_settings)(cur)
+            entry = _mac_unrecorded_entry(path, plain) if beacon_parts else None
+            if entry is None:
+                continue
+            legacy_mac[os.path.basename(path)] = entry
+            if allow_mac:
+                continue
+            mac_src[os.path.basename(path)] = entry
+            if path == mp:
+                new_mcp, c = _strip_mac_entry(path, new_mcp, entry)
+                ch_mcp += [f"{x} (no --allow-mac)" for x in c]
+            elif path == sp:
+                new, c = _strip_mac_entry(path, new, entry)
+                ch += [f"{x} (no --allow-mac)" for x in c]
+            else:
+                o_new, c = _strip_mac_entry(path, o_new, entry)
+                ch_o += [f"{x} (no --allow-mac)" for x in c]
 
     # The record of what setup adds because it is absent, written before any wired file: an interrupted
     # setup leaves a record that covers what it wrote. A re-run (an interrupted run, a moved checkout) adds
     # to it; what an earlier setup recorded stays recorded, and what was there before stays the user's.
-    files = dict(old_record["files"]) if old_record else {}
+    files = dict(base["files"]) if base else {}
     wired = {}
     for path, before, after, legacy, make, merge in (
             (sp, s_before, new, _legacy_settings_entry, _settings_record, _merge_settings_entry),
-            (other, o_before, o_before, _legacy_settings_entry, _settings_record, _merge_settings_entry),
+            (other, o_before, o_new, _legacy_settings_entry, _settings_record, _merge_settings_entry),
             (mp, m_before, new_mcp, _legacy_mcp_entry, _mcp_record, _merge_mcp_entry)):
         name = os.path.basename(path)
-        inherited = (old_record["files"].get(name) if old_record else legacy(path, before))
+        if base:
+            inherited = base["files"].get(name)
+        else:
+            # beacon's own legacy parts are judged on the file without setup's labhand-mac parts (they would
+            # read as "something else in the file"); those parts are setup's too
+            um = legacy_mac.get(name)
+            judged = _strip_mac_entry(path, before, um)[0] if um else before
+            if (um and name != ".mcp.json" and judged.get("enabledMcpjsonServers") == []
+                    and _json_backup(path) is None):
+                # a file setup created (no backup) whose labhand-mac enable the user took out: the list left
+                # empty is setup's residue, not something else in the file (it stays, as with a record)
+                judged = {k: v for k, v in judged.items() if k != "enabledMcpjsonServers"}
+            inherited = legacy(path, judged)
+            if um:
+                inherited = _with_mac(name, inherited, um)
+        # each server's parts are judged alone: losing a labhand-mac part (the server disabled, its rule
+        # removed, an interrupted revocation) must not make setup forget beacon's own parts
+        inherited = (_prune_mcp_entry if name == ".mcp.json" else _prune_settings_entry)(before, inherited)
         strip = strip_mcp if name == ".mcp.json" else strip_settings
         live = _holds_entry(name, before, inherited)
         wired[name] = live is True and bool(strip(before, inherited)[1])
@@ -344,12 +487,21 @@ def setup_project(project, python, mcp_python, shared=False, allow_labhand=False
         # the file, an interrupted teardown that already stripped it): the file as it is now is the pre-run
         # state, and a rule the user added since (even one equal to beacon's) is theirs
         files[name] = merge(None if live is False else inherited, make(before, after))
+        if mac_src:
+            # what revoking took out of the file is no change of setup's to record (a server it took away
+            # would otherwise read as "replaced")
+            files[name] = _without_mac(name, files[name])
     record = {RECORD_KEY: 1, "files": files}
+    rp = os.path.join(project, RECORD)
+    # Revoking: the record keeps listing the labhand-mac parts until the files no longer hold them, so a run
+    # stopped in between leaves them recorded (the next run takes them back) instead of looking like yours.
+    first = record if not mac_src else {RECORD_KEY: 1, "files": {
+        n: _with_mac(n, files.get(n), mac_src.get(n)) for n in list(files) + [k for k in mac_src if k not in files]}}
     if record != old_record:
-        rp = os.path.join(project, RECORD)
         changes.append(f"{RECORD}: {'recorded' if old_record is None else 'updated the record of'} what setup "
                        f"added (teardown removes only that; what you had before stays)")
-        _write(rp, json.dumps(record, indent=2) + "\n", dry_run, backup=False)
+    if first != old_record:
+        _write(rp, json.dumps(first, indent=2) + "\n", dry_run, backup=False)
 
     ch_real = [c for c in ch if not c.startswith("left ")]
     notes = [c for c in ch if c.startswith("left ")]
@@ -360,9 +512,16 @@ def setup_project(project, python, mcp_python, shared=False, allow_labhand=False
                     for c in ch + _setup_backup(sp, dry_run, wired[os.path.basename(sp)])]
         _write(sp, json.dumps(new, indent=2) + "\n", dry_run, backup=False)
 
+    if ch_o:
+        changes += [f"{os.path.relpath(other, project)}: {c}"
+                    for c in ch_o + _setup_backup(other, dry_run, wired[os.path.basename(other)])]
+        _write(other, json.dumps(o_new, indent=2) + "\n", dry_run, backup=False)
+
     if ch_mcp:
         changes += [f".mcp.json: {c}" for c in ch_mcp + _setup_backup(mp, dry_run, wired[".mcp.json"])]
         _write(mp, json.dumps(new_mcp, indent=2) + "\n", dry_run, backup=False)
+    if record != first:
+        _write(rp, json.dumps(record, indent=2) + "\n", dry_run, backup=False)     # revoked: now forget them
 
     wp = os.path.join(project, ".claude", "beacon")
     # the wrapper runs under sh / Git Bash; the separator is the one Python on this OS splits PYTHONPATH on
@@ -453,11 +612,25 @@ def _settings_record(before, after):
     for k in ("respondToBashCommands",):
         if k in after and (k not in before or before[k] != after[k]):
             keys[k] = {"set": after[k], "had": k in before, "value": before.get(k)}
-    return {"hooks": added, "hooks_replaced": replaced,
-            "allow": [r for r in _rules(after, "allow") if r not in allow_b and (_ours_allow(r) or r == "mcp__labhand")],
-            "deny": [r for r in _rules(after, "deny") if r not in deny_b and _ours_deny(r)],
-            "keys": keys, "enabled_had": "beacon" in _list(before.get("enabledMcpjsonServers")),
-            "beacon_tools_had": [r for r in allow_b if str(r).startswith("mcp__beacon__")]}
+    e = {"hooks": added, "hooks_replaced": replaced,
+         "allow": [r for r in _rules(after, "allow") if r not in allow_b
+                   and (_ours_allow(r) or r in ("mcp__labhand", MAC_ALLOW))],
+         "deny": [r for r in _rules(after, "deny") if r not in deny_b and _ours_deny(r)],
+         "keys": keys, "enabled_had": "beacon" in _list(before.get("enabledMcpjsonServers")),
+         "beacon_tools_had": [r for r in allow_b if str(r).startswith("mcp__beacon__")]}
+    # the other servers setup enabled (labhand-mac: --allow-mac), and their per-tool approvals there already
+    # were (teardown leaves those); only when there are any, so a plain setup's record is as it always was
+    had = _list(before.get("enabledMcpjsonServers"))
+    enabled = [n for n in EXTRA_SERVERS if n in _list(after.get("enabledMcpjsonServers")) and n not in had]
+    if enabled:
+        e["enabled_added"] = enabled
+        # an empty list the user had stays a (now empty again) list at teardown
+        e["enabled_key_had"] = isinstance(before.get("enabledMcpjsonServers"), list)
+    tools_had = {n: [r for r in allow_b if str(r).startswith(f"mcp__{n}__")] for n in EXTRA_SERVERS
+                 if f"mcp__{n}" in e["allow"] or n in enabled}
+    if tools_had:
+        e["tools_had"] = tools_had
+    return e
 
 
 def _holds_entry(name, cur, entry):
@@ -466,20 +639,19 @@ def _holds_entry(name, cur, entry):
     if not entry:
         return None
     if name == ".mcp.json":
-        servers = (cur or {}).get("mcpServers")
-        b = servers.get("beacon") if isinstance(servers, dict) else None
-        if entry.get("server") == "added":
-            return b is not None
-        if entry.get("server") == "replaced":
-            return b is not None and b != entry.get("old")
-        return None
+        held = [_server_holds(cur, "beacon", entry)] + [
+            _server_holds(cur, n, r) for n, r in _extra_entries(entry).items()]
+        held = [h for h in held if h is not None]
+        return all(held) if held else None
     hooks, allow, deny = _list(entry.get("hooks")), _list(entry.get("allow")), _list(entry.get("deny"))
     replaced = entry.get("hooks_replaced") or {}
-    if not (hooks or allow or deny or replaced):
+    enabled = _list(entry.get("enabled_added"))
+    if not (hooks or allow or deny or replaced or enabled):
         return None
     return (all(_beacon_hooks(cur, e) for e in hooks)
             and all(_beacon_hooks(cur, e) and _beacon_hooks(cur, e) != old for e, old in replaced.items())
-            and all(r in _rules(cur, "allow") for r in allow) and all(r in _rules(cur, "deny") for r in deny))
+            and all(r in _rules(cur, "allow") for r in allow) and all(r in _rules(cur, "deny") for r in deny)
+            and all(n in _list((cur or {}).get("enabledMcpjsonServers")) for n in enabled))
 
 
 def _merge_settings_entry(old, new):
@@ -498,12 +670,26 @@ def _merge_settings_entry(old, new):
     for k in ("allow", "deny"):
         e[k] += [r for r in new[k] if r not in e[k]]
     e["keys"].update({k: v for k, v in new["keys"].items() if k not in e["keys"]})
+    enabled = _list(e.get("enabled_added")) + [n for n in _list(new.get("enabled_added"))
+                                               if n not in _list(e.get("enabled_added"))]
+    if enabled:
+        e["enabled_added"] = enabled
+        e.setdefault("enabled_key_had", new.get("enabled_key_had", False))
+    tools_had = dict(new.get("tools_had") or {})
+    tools_had.update(old.get("tools_had") or {})
+    if tools_had:
+        e["tools_had"] = tools_had
     return e
 
 
-def _mcp_record(before, after):
-    b = ((before or {}).get("mcpServers") or {}).get("beacon") if isinstance((before or {}).get("mcpServers"), dict) else None
-    a = ((after or {}).get("mcpServers") or {}).get("beacon") if isinstance((after or {}).get("mcpServers"), dict) else None
+def _server_of(cfg, name):
+    servers = (cfg or {}).get("mcpServers")
+    return servers.get(name) if isinstance(servers, dict) else None
+
+
+def _server_record(before, after, name):
+    """What setup did to the server `name`: {"server": "added"}, {"server": "replaced", "old": ...}, or {}."""
+    b, a = _server_of(before, name), _server_of(after, name)
     if a is not None and b is None:
         return {"server": "added"}
     if b is not None and a != b:
@@ -511,28 +697,186 @@ def _mcp_record(before, after):
     return {}
 
 
+def _mcp_record(before, after):
+    """The .mcp.json entry: the `beacon` server's at the top level (as every record since the first), the
+    other servers setup added (EXTRA_SERVERS) under "servers", only when there are any."""
+    e = _server_record(before, after, "beacon")
+    servers = {n: r for n in EXTRA_SERVERS for r in [_server_record(before, after, n)] if r}
+    if servers:
+        e["servers"] = servers
+    return e
+
+
+def _extra_entries(entry):
+    """name -> record entry of the servers besides `beacon` an .mcp.json entry lists."""
+    servers = (entry or {}).get("servers")
+    return {n: r for n, r in servers.items() if isinstance(r, dict) and r.get("server")} \
+        if isinstance(servers, dict) else {}
+
+
+def _server_holds(cur, name, sub):
+    """Does .mcp.json (`cur`) still hold what a server's record entry says setup wrote? None: nothing to check."""
+    s = _server_of(cur, name)
+    if sub.get("server") == "added":
+        return s is not None
+    if sub.get("server") == "replaced":
+        return s is not None and s != sub.get("old")
+    return None
+
+
+def _prune_mcp_entry(cur, entry):
+    """An .mcp.json entry without the servers the file no longer holds as setup wrote them (stale: an
+    interrupted setup or teardown). Each server is judged alone, so a server the user removed during the run
+    does not make setup forget the others it added."""
+    if not entry:
+        return entry
+    e = {k: v for k, v in entry.items() if k != "servers"}
+    if _server_holds(cur, "beacon", e) is False:
+        e = {}
+    servers = {n: r for n, r in _extra_entries(entry).items() if _server_holds(cur, n, r) is not False}
+    if servers:
+        e["servers"] = servers
+    return e
+
+
+def _prune_settings_entry(cur, entry):
+    """A settings record entry without the labhand-mac parts the file (`cur`) no longer holds: its
+    enabledMcpjsonServers entry, its allow rule, and (once neither is left) its per-tool approvals record.
+    Staleness (`_holds_entry`) is then decided on what is left, so a lost labhand-mac part never drops
+    beacon's own parts from the record. Beacon's parts are untouched; an entry without labhand-mac parts is
+    returned as it is."""
+    if entry and LABHAND_ALLOW in _list(entry.get("allow")) and LABHAND_ALLOW not in _rules(cur, "allow"):
+        # the --allow-labhand rule is optional like labhand-mac's parts: losing it (removed by hand, an
+        # interrupted run that recorded it before writing the file) must not make the rest look stale
+        entry = dict(entry, allow=[r for r in entry["allow"] if r != LABHAND_ALLOW])
+    if not entry or not _mac_in_entry("settings", entry):
+        return entry
+    e = json.loads(json.dumps(entry))
+    if MAC_ALLOW in _list(e.get("allow")) and MAC_ALLOW not in _rules(cur, "allow"):
+        e["allow"] = [r for r in e["allow"] if r != MAC_ALLOW]
+    if MAC_SERVER in _list(e.get("enabled_added")) and MAC_SERVER not in _list((cur or {}).get("enabledMcpjsonServers")):
+        e["enabled_added"] = [n for n in e["enabled_added"] if n != MAC_SERVER]
+        if not e["enabled_added"]:
+            # enabled_key_had stays: whether the list existed before the first setup is still known, so a
+            # list setup created and the user emptied goes at teardown
+            del e["enabled_added"]
+    if MAC_ALLOW not in _list(e.get("allow")) and MAC_SERVER not in _list(e.get("enabled_added")):
+        if isinstance(e.get("tools_had"), dict):
+            e["tools_had"].pop(MAC_SERVER, None)
+            if not e["tools_had"]:
+                del e["tools_had"]
+    return e
+
+
 def _merge_mcp_entry(old, new):
-    return old if old and old.get("server") else new
+    """An earlier setup's entry wins for each server it lists (it knows the pre-run state); this setup's
+    entry fills in the servers it does not."""
+    base = old if old and old.get("server") else new
+    e = {k: v for k, v in (base or {}).items() if k != "servers"}
+    servers = dict(_extra_entries(new))
+    servers.update(_extra_entries(old))
+    if servers:
+        e["servers"] = servers
+    return e
+
+
+def _mac_in_entry(name, entry):
+    """Does a record entry list a labhand-mac part setup added (server, enable, allow rule)?"""
+    if not entry:
+        return False
+    if name == ".mcp.json":
+        return MAC_SERVER in _extra_entries(entry)
+    return (MAC_ALLOW in _list(entry.get("allow")) or MAC_SERVER in _list(entry.get("enabled_added"))
+            or MAC_SERVER in (entry.get("tools_had") if isinstance(entry.get("tools_had"), dict) else {}))
+
+
+def _mac_settings_rec(entry, cur):
+    """A settings record entry holding only the labhand-mac parts of `entry`, for _strip_settings_recorded:
+    beacon's parts (its hooks, rules, enable, the mcp__beacon__* approvals in `cur`) are all left."""
+    tools_had = entry.get("tools_had") if isinstance(entry.get("tools_had"), dict) else {}
+    rec = {"hooks": [], "hooks_replaced": {}, "deny": [], "keys": {}, "enabled_had": True,
+           "allow": [MAC_ALLOW] if MAC_ALLOW in _list(entry.get("allow")) else [],
+           "beacon_tools_had": [r for r in _rules(cur, "allow") if str(r).startswith("mcp__beacon__")]}
+    if MAC_SERVER in _list(entry.get("enabled_added")):
+        rec["enabled_added"] = [MAC_SERVER]
+        rec["enabled_key_had"] = bool(entry.get("enabled_key_had"))
+    if MAC_SERVER in tools_had:
+        rec["tools_had"] = {MAC_SERVER: _list(tools_had[MAC_SERVER])}
+    return rec
+
+
+def _without_mac(name, entry):
+    """A record entry without its labhand-mac parts (what stays setup's once the grant is revoked)."""
+    if not entry:
+        return entry
+    e = json.loads(json.dumps(entry))
+    if name == ".mcp.json":
+        if isinstance(e.get("servers"), dict):
+            e["servers"].pop(MAC_SERVER, None)
+            if not e["servers"]:
+                del e["servers"]
+        return e
+    if isinstance(e.get("allow"), list):
+        e["allow"] = [r for r in e["allow"] if r != MAC_ALLOW]
+    if isinstance(e.get("enabled_added"), list):
+        e["enabled_added"] = [n for n in e["enabled_added"] if n != MAC_SERVER]
+        if not e["enabled_added"]:
+            del e["enabled_added"]
+            e.pop("enabled_key_had", None)
+    if isinstance(e.get("tools_had"), dict):
+        e["tools_had"].pop(MAC_SERVER, None)
+        if not e["tools_had"]:
+            del e["tools_had"]
+    return e
+
+
+def _with_mac(name, entry, old):
+    """A record entry plus the labhand-mac parts the earlier entry `old` lists (undoes `_without_mac`)."""
+    e = json.loads(json.dumps(entry or {}))
+    if not _mac_in_entry(name, old):
+        return e
+    if name == ".mcp.json":
+        servers = e["servers"] if isinstance(e.get("servers"), dict) else {}
+        servers[MAC_SERVER] = _extra_entries(old)[MAC_SERVER]
+        e["servers"] = servers
+        return e
+    if MAC_ALLOW in _list(old.get("allow")):
+        e["allow"] = _list(e.get("allow")) + [MAC_ALLOW]
+    if MAC_SERVER in _list(old.get("enabled_added")):
+        e["enabled_added"] = _list(e.get("enabled_added")) + [MAC_SERVER]
+        e["enabled_key_had"] = bool(old.get("enabled_key_had"))
+    if isinstance(old.get("tools_had"), dict) and MAC_SERVER in old["tools_had"]:
+        tools_had = e["tools_had"] if isinstance(e.get("tools_had"), dict) else {}
+        tools_had[MAC_SERVER] = old["tools_had"][MAC_SERVER]
+        e["tools_had"] = tools_had
+    return e
 
 
 def _legacy_settings_entry(path, cur):
     """No record (the project was wired by a setup older than it, and not torn down): what of `cur` is
     beacon's, judged from that setup's .beacon-bak (its pre-run state); with no backup, only a file that
-    holds nothing but beacon's parts, among them the `mcp__beacon` allow rule every setup since the first has
-    written (that setup created it; a user's own file with, say, only a beacon hook is not taken for one).
+    holds nothing but beacon's parts (and the mcp__labhand rule `--allow-labhand` adds), among them the
+    `mcp__beacon` allow rule every setup since the first has written (that setup created it; a user's own file
+    with, say, only a beacon hook is not taken for one).
     Otherwise None: nothing in it is beacon's."""
     if not strip_settings(cur)[1]:
         return None
     bak = _json_backup(path)
     if bak is not None:
         before = bak
-    elif (not strip_settings(cur)[0] and "mcp__beacon" in _rules(cur, "allow")
+    elif (_only_labhand_rule(strip_settings(cur)[0]) and "mcp__beacon" in _rules(cur, "allow")
           and any(_beacon_hooks(cur, e) for e, _, _ in HOOK_EVENTS)):
         before = {}
     else:
         return None
     e = _settings_record(before, cur)
     return e if e["hooks"] or e["hooks_replaced"] or e["allow"] or e["deny"] else None
+
+
+def _only_labhand_rule(rest):
+    """Is `rest` (a settings object with beacon's parts stripped) empty, or does it hold only the mcp__labhand
+    allow rule `--allow-labhand` writes (strip_settings without a record keeps that rule)?"""
+    return not rest or rest == {"permissions": {"allow": ["mcp__labhand"]}}
 
 
 def _legacy_mcp_entry(path, cur):
@@ -660,8 +1004,13 @@ def _strip_settings_recorded(settings, rec):
     perms = s.get("permissions")
     if isinstance(perms, dict):
         had_tools = set(_list(rec.get("beacon_tools_had")))
+        other_tools = rec.get("tools_had") if isinstance(rec.get("tools_had"), dict) else {}
+
+        def other_tool(r):
+            # a per-tool approval of a server setup added (mcp__labhand-mac__*) that was not there before
+            return any(str(r).startswith(f"mcp__{n}__") and r not in _list(had) for n, had in other_tools.items())
         for key, ours in (("allow", lambda r: r in _list(rec.get("allow")) or (
-                              str(r).startswith("mcp__beacon__") and r not in had_tools)),
+                              str(r).startswith("mcp__beacon__") and r not in had_tools) or other_tool(r)),
                           ("deny", lambda r: r in _list(rec.get("deny")))):
             rules = perms.get(key)
             if not isinstance(rules, list):
@@ -684,11 +1033,13 @@ def _strip_settings_recorded(settings, rec):
                 del s[k]
                 changes.append(f"removed {k}")
     servers = s.get("enabledMcpjsonServers")
-    if isinstance(servers, list) and "beacon" in servers and not rec.get("enabled_had"):
-        s["enabledMcpjsonServers"] = [x for x in servers if x != "beacon"]
-        changes.append("removed beacon from enabledMcpjsonServers")
-        if not s["enabledMcpjsonServers"]:
-            del s["enabledMcpjsonServers"]
+    gone = [n for n in (["beacon"] if not rec.get("enabled_had") else []) + _list(rec.get("enabled_added"))
+            if isinstance(servers, list) and n in servers]
+    for n in gone:
+        s["enabledMcpjsonServers"] = [x for x in s["enabledMcpjsonServers"] if x != n]
+        changes.append(f"removed {n} from enabledMcpjsonServers")
+    if gone and not s["enabledMcpjsonServers"] and not rec.get("enabled_key_had"):
+        del s["enabledMcpjsonServers"]
     return s, changes
 
 
@@ -709,19 +1060,27 @@ def strip_mcp(cfg, rec=None):
     when setup added it, put back as it was when setup replaced it, else left (it was the project's)."""
     c = json.loads(json.dumps(cfg or {}))
     servers = c.get("mcpServers")
-    if not isinstance(servers, dict) or "beacon" not in servers:
+    if not isinstance(servers, dict):
         return c, []
-    if rec is not None and rec.get("server") == "replaced":
-        if servers["beacon"] == rec.get("old"):
-            return c, []
-        servers["beacon"] = rec.get("old")
-        return c, ["restored your beacon MCP server entry as it was before setup"]
-    if rec is not None and rec.get("server") != "added":
-        return c, []
-    del servers["beacon"]
-    if not servers:
+    changes = []
+    # beacon by the entry's top level (or every beacon server without a record); the other servers setup
+    # added only by the entry's "servers" (no setup without a record ever added one)
+    todo = [("beacon", rec)] + list(_extra_entries(rec).items())
+    for name, sub in todo:
+        if name not in servers:
+            continue
+        if sub is not None and sub.get("server") == "replaced":
+            if servers[name] != sub.get("old"):
+                servers[name] = sub.get("old")
+                changes.append(f"restored your {name} MCP server entry as it was before setup")
+            continue
+        if sub is not None and sub.get("server") != "added":
+            continue
+        del servers[name]
+        changes.append(f"removed {name} MCP server")
+    if changes and not servers:
         del c["mcpServers"]
-    return c, ["removed beacon MCP server"]
+    return c, changes
 
 
 def strip_claude_md(text, original=None):
@@ -818,11 +1177,85 @@ def _strip_json(path, obj, record=None):
     """strip_mcp / strip_settings for the file at `path` (by setup's record when there is one), plus the
     empty `mcpServers` strip_mcp drops only when it removed beacon from it. -> (stripped object, changes)."""
     if os.path.basename(path) != ".mcp.json":
-        return strip_settings(obj, _entry(record, path))
+        s, ch = strip_settings(obj, _entry(record, path))
+        return _strip_mac_unrecorded(path, s, ch) if record is None else (s, ch)
     c, ch = strip_mcp(obj, _entry(record, path))
+    if record is None:
+        c, ch = _strip_mac_unrecorded(path, c, ch)
     if c.get("mcpServers") == {}:
         del c["mcpServers"]
     return c, ch
+
+
+def _only_mac_settings(s):
+    """Does a settings object (beacon's parts already stripped) hold nothing but (a subset of) what
+    --allow-mac adds (plus the mcp__labhand rule an unrecorded teardown keeps anyway), with at least one
+    labhand-mac part present? A file that lost one labhand-mac part (server disabled, rule removed) still
+    counts; a file with anything else in it does not."""
+    if not isinstance(s, dict) or not set(s) <= {"permissions", "enabledMcpjsonServers"}:
+        return False
+    perms = s.get("permissions", {})
+    if not isinstance(perms, dict) or not set(perms) <= {"allow"}:
+        return False
+    allow, enabled = perms.get("allow", []), s.get("enabledMcpjsonServers", [])
+    if not isinstance(allow, list) or not isinstance(enabled, list):
+        return False
+    if not all(r in (MAC_ALLOW, LABHAND_ALLOW) or (isinstance(r, str) and r.startswith(MAC_ALLOW + "__"))
+               for r in allow) or not all(n == MAC_SERVER for n in enabled):
+        return False
+    return MAC_ALLOW in allow or MAC_SERVER in enabled
+
+
+def _looks_like_mac_entry(server):
+    # the shape setup writes for labhand-mac: a command and its args, nothing else (no env)
+    return (isinstance(server, dict) and set(server) == {"command", "args"} and isinstance(server["command"], str)
+            and isinstance(server["args"], list))
+
+
+def _mac_unrecorded_entry(path, cur):
+    """No record: the labhand-mac parts of `cur` (beacon's own parts already stripped from it) that setup
+    added, judged like beacon's own legacy parts: absent from setup's .beacon-bak, or (no backup: setup
+    created the file) the file holds nothing else. -> a record entry holding only those parts, or None (a
+    labhand-mac part the user had before setup stays theirs)."""
+    name = os.path.basename(path)
+    bak = _json_backup(path)
+    if name == ".mcp.json":
+        server = _server_of(cur, MAC_SERVER)
+        if server is None:
+            return None
+        if bak is not None:
+            sub = _server_record(bak, cur, MAC_SERVER)
+        else:
+            only = set(cur) == {"mcpServers"} and list(cur["mcpServers"]) == [MAC_SERVER]
+            sub = {"server": "added"} if only and _looks_like_mac_entry(server) else {}
+        return {"servers": {MAC_SERVER: sub}} if sub else None
+    if bak is not None:
+        before = bak
+    elif _only_mac_settings(cur):
+        before = {}
+    else:
+        return None
+    e = _settings_record(before, cur)
+    return _with_mac(name, {}, e) if _mac_in_entry(name, e) else None
+
+
+def _strip_mac_entry(path, cur, entry):
+    """Take the labhand-mac parts a record entry lists out of the object `cur`. -> (object, changes)."""
+    if os.path.basename(path) == ".mcp.json":
+        return strip_mcp(cur, {"servers": {MAC_SERVER: _extra_entries(entry)[MAC_SERVER]}})
+    return _strip_settings_recorded(cur, _mac_settings_rec(entry, cur))
+
+
+def _strip_mac_unrecorded(path, cur, ch):
+    """Teardown without a record (deleted by hand): the labhand-mac parts setup added (`_mac_unrecorded_entry`),
+    only in a file beacon was wired in (`ch`: beacon's parts were removed from it). -> (object, changes)."""
+    if not ch:
+        return cur, ch
+    entry = _mac_unrecorded_entry(path, cur)
+    if entry is None:
+        return cur, ch
+    c, more = _strip_mac_entry(path, cur, entry)
+    return c, ch + more
 
 
 def _same_as_backup(path, bak, new, record=None):

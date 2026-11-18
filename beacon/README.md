@@ -95,7 +95,8 @@ the PreToolUse guard refuses them from the worker's Bash; no MCP tool reaches th
 - the hooks, allow rules (`mcp__beacon`, `mcp__labhand`) and deny rules `setup-project` added to
   `.claude/settings.json` / `.claude/settings.local.json`, the `respondToBashCommands` it set, and the
   `mcp__beacon__*` approvals and `enabledMcpjsonServers` entry the run added;
-- the beacon server in `.mcp.json`, when setup added it;
+- the beacon server in `.mcp.json`, when setup added it (and the `labhand-mac` server of
+  `--allow-mac`, with its `enabledMcpjsonServers` entry and `mcp__labhand-mac` rule, likewise);
 - `.claude/beacon`, when it is beacon's own command (by content); any other file there is the
   project's and stays untouched (one setup replaced is put back from its backup);
 - `.claude/beacon-setup.json`, setup's record (last, so an interrupted teardown can be run again).
@@ -150,6 +151,45 @@ anything the project owns: setup and teardown remove it, and it never stands in 
 An `mcp__labhand` allow rule `setup-project --allow-labhand` added is removed; one the project had
 before stays (without a record: kept and reported, since it may have been the project's). `--dry-run`
 shows what would change. The real run needs a terminal and is refused from the worker's Bash.
+
+### Mac control: `setup-project --allow-mac`
+
+`labhand-mac` (control of this Mac: mouse, keyboard, screen) is a separate MCP server that is **not**
+registered at Claude Code's user scope, so it is absent from every session unless the project was given
+it. `beacon setup-project DIR --allow-mac` (ccbridge passes it for a task granted Mac control, as it passes
+`--allow-labhand`) adds:
+
+- to `DIR/.mcp.json` the server `labhand-mac`, an existing Mac-control engine registered under that
+  name. By default it is **Cua Driver**: `command` = `~/.local/bin/cua-driver` (written as an absolute
+  path), `args` = `["mcp"]`. `cua-driver mcp` proxies to the `CuaDriver.app` daemon, and that app (not
+  Claude Code, not beacon) holds the macOS permissions (Accessibility, Screen Recording): grant them to
+  the engine's own app once. Override with `LABHAND_MAC_MCP_COMMAND`, a JSON array of strings, the program
+  then its args, e.g. `LABHAND_MAC_MCP_COMMAND='["/opt/engine/bin/eng", "mcp"]'`. A program given as a
+  path (with `~` or a `/`) is made absolute (`~` expanded, a relative path taken from the directory setup
+  runs in), since Claude Code starts the server without a shell from the project's directory; a bare name
+  stays, for a `PATH` lookup; the args are written as given. A malformed value (not JSON, not a non-empty
+  array of strings, an empty program) is refused with an error before anything is written. The entry has
+  no `env` at all (no `PYTHONPATH`: an inherited beacon home on it once made the labhand server import
+  the wrong copy);
+- to the settings file setup writes: `labhand-mac` in `enabledMcpjsonServers` (Claude Code starts it
+  without asking) and the allow rule `mcp__labhand-mac` (every `mcp__labhand-mac__*` tool the engine offers).
+
+Without `--allow-mac` nothing about `labhand-mac` is written. `--allow-mac` and `--allow-labhand` are
+independent. Setup only writes the command, never runs it; `beacon doctor --project DIR` reports (never
+fails on) whether the server's program exists and is executable, and prints `<program> --version` when
+it answers within 5 s. The record covers it like the beacon
+server: teardown removes the `labhand-mac` server, its `enabledMcpjsonServers` entry, the
+`mcp__labhand-mac` rule and `mcp__labhand-mac__*` approvals only when this setup added them; a
+`labhand-mac` entry, approval or rule you had before setup stays (a server entry setup rewrote gets your
+old value back). A re-run with the same flags changes nothing. The grant follows the flag: a re-run
+without `--allow-mac` (a task restarted without the grant) takes back exactly the `labhand-mac` parts an
+earlier setup recorded adding, by the same rules as teardown, and drops them from the record; what you
+had before stays. Losing one `labhand-mac` part during the run (the server disabled, its rule removed)
+never makes setup forget its other parts or beacon's own; nor does losing the `mcp__labhand` rule
+`--allow-labhand` adds (removed by hand, an interrupted run). If the record was deleted by hand, teardown,
+and a setup re-run without `--allow-mac`, still remove the `labhand-mac` parts that setup's `.beacon-bak`
+shows were not there before (with no backup: only from a file that holds nothing else, i.e. one setup
+created: nothing but beacon's parts and some or all of what `--allow-mac` writes).
 
 ### Running beacon on a repo that contains beacon
 

@@ -335,10 +335,15 @@ def cmd_watch(args):
 
 
 def cmd_setup_project(args):
-    from .project import setup_project
+    from .project import MacCommandError, setup_project
     py = args.python or sys.executable
-    changes = setup_project(args.project, py, args.mcp_python or py, shared=args.shared,
-                            allow_labhand=args.allow_labhand, dry_run=args.dry_run, quiet_shell=args.quiet_shell)
+    try:
+        changes = setup_project(args.project, py, args.mcp_python or py, shared=args.shared,
+                                allow_labhand=args.allow_labhand, dry_run=args.dry_run,
+                                quiet_shell=args.quiet_shell, allow_mac=args.allow_mac)
+    except MacCommandError as e:
+        print(f"error: {e} (nothing was written)", file=sys.stderr)
+        return 2
     print(("Would change:" if args.dry_run else "Changed:") if changes else "Already set up; nothing to change.")
     for c in changes:
         print("  " + c)
@@ -569,6 +574,13 @@ def build_parser():
     p.add_argument("--shared", action="store_true", help="write .claude/settings.json instead of settings.local.json")
     p.add_argument("--allow-labhand", dest="allow_labhand", action="store_true",
                    help="also pre-approve every labhand MCP tool (they act on the VMs; your call)")
+    p.add_argument("--allow-mac", dest="allow_mac", action="store_true",
+                   help="also give this project the labhand-mac MCP server (controls THIS Mac: mouse, keyboard, "
+                        "screen): added to the project's .mcp.json ($LABHAND_MAC_MCP_COMMAND, a JSON array "
+                        "[program, args...], else ~/.local/bin/cua-driver mcp; the engine's own app holds the macOS "
+                        "permissions), enabled and its tools pre-approved (mcp__labhand-mac); "
+                        "teardown-project removes it. Without the flag the server is not there at all, and a "
+                        "re-run without it takes back a grant an earlier setup added")
     p.add_argument("--quiet-shell", action="store_true",
                    help="set respondToBashCommands=false: `! .claude/beacon log` output gets no model reply")
     p.add_argument("--dry-run", action="store_true")

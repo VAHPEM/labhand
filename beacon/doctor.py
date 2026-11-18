@@ -231,6 +231,39 @@ def check_labhand(rep):
                                         f"labhand not importable here; vm_check will fail: {last}")
 
 
+def check_labhand_mac(rep, project):
+    """Informational: when the project's .mcp.json has the labhand-mac server (`setup-project --allow-mac`),
+    does its program exist and is it executable, and what does `<program> --version` answer (within 5 s)?
+    Never a FAIL. The macOS permissions belong to the engine's own app/daemon (Cua Driver: CuaDriver.app)."""
+    from .project import MAC_SERVER
+    proj = os.path.abspath(os.path.expanduser(project))
+    data, _ = _read_json(os.path.join(proj, ".mcp.json"))
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    entry = servers.get(MAC_SERVER) if isinstance(servers, dict) else None
+    if not isinstance(entry, dict):
+        return
+    prog = entry.get("command") if isinstance(entry.get("command"), str) else ""
+    # Claude Code starts the server from the project's directory: a bare name is looked up on PATH
+    if not prog:
+        path = ""
+    elif os.sep in prog or (os.altsep and os.altsep in prog):
+        path = os.path.join(proj, prog)          # an absolute prog stays as it is
+    else:
+        path = shutil.which(prog) or ""
+    if not path or not os.path.isfile(path):
+        rep.warn(f"{MAC_SERVER} MCP server: its program {prog!r} does not exist; Mac control will not start")
+        return
+    if not os.access(path, os.X_OK):
+        rep.warn(f"{MAC_SERVER} MCP server: its program {path} is not executable; Mac control will not start")
+        return
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}     # as the server runs: no PYTHONPATH
+    code, out = _run([path, "--version"], env=env, timeout=5)
+    first = (out.strip().splitlines() or [""])[0][:200]
+    rep.ok(f"{MAC_SERVER} MCP server: {path} exists and is executable"
+           + (f"; --version: {first}" if code == 0 and first else
+              f"; --version did not answer within 5 s or failed ({first or f'exit {code}'})"))
+
+
 def doctor(run=None, project=None, claude=None):
     rep = Report()
     check_python(rep)
@@ -241,4 +274,6 @@ def doctor(run=None, project=None, claude=None):
         check_project(rep, project)
     check_keys(rep)
     check_labhand(rep)
+    if project and os.path.isdir(os.path.abspath(os.path.expanduser(project))):
+        check_labhand_mac(rep, project)
     return rep
