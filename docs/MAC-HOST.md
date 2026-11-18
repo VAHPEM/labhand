@@ -217,6 +217,52 @@ All CLI calls go to the same daemon. `--json`/JSON arguments as in the MCP schem
   to the front).
 - Correct Unicode: `Xin chào labhand-mac 123` typed by element and read back equal.
 
+## 6b. Live end-to-end (2026-11-19)
+
+First run through the real bridge (`~/.ccbridge/reviews/mac-e2e/E2E.md`, raw
+`latency.txt`, `probes.jsonl`): a ccbridge `--allow-mac` worker drove TextEdit only through
+`mcp__labhand-mac__*` (Cua Driver 0.53.2, default argv `cua-driver mcp`, `session:"e2e"`).
+
+- **Definitions are deferred.** All 61 tools were present by name only; none was loaded up
+  front. One `ToolSearch select:` loaded 8 schemas (`list_windows`, `get_window_state`,
+  `type_text`, `set_value`, `click`, `launch_app`, `invoke_menu`, `run_steps`); 6 were
+  called (`invoke_menu` and `run_steps` were not needed).
+- **Flow:** find TextEdit → `launch_app` (no URLs) → observe → `set_value ""` → `type_text`
+  `Xin chào từ labhand-mac 42` by element → read back → close button by element → sheet
+  → `Delete` by element → window gone. Read-back exact (26 code points, NFC).
+- **14 calls, ~6.5 s of Mac tool time** (tool_use → tool_result, from the transcript; the
+  whole flow took ~90 s of clock, mostly model turns and probes). Per call:
+
+  | call | latency |
+  |---|---|
+  | `list_windows` (×3) | 126, 113, 111 ms |
+  | `launch_app` | 728 ms |
+  | `get_window_state` (×6: placeholder id, document, elements budget 11, `query`, `max_depth:2` + `query`, sheet query) | 124, 212, 119, 284, 175, 320 ms |
+  | `set_value` (clear, `confirmed`) | 720 ms |
+  | `type_text` 26 chars by element (`confirmed`) | 571 ms |
+  | `click` close button / `Delete` by element (`unverifiable`, both worked) | 1517, 1337 ms |
+
+- **Background:** `launch_app` without URLs did not activate TextEdit
+  (`self_activation_suppressed:true`); the frontmost app (Chrome) never changed in 11
+  probes. The document window was on Space 1 while the user was on Space 22; every element
+  action still worked. Over the input actions (`set_value`, `type_text`, both `click`s)
+  the cursor stayed exactly the same; it moved only across reads and while no input tool
+  ran (a person was using the Mac), so nothing shows the driver moving it.
+- **What went wrong (now in the skill):** `launch_app` returned placeholder window ids
+  (`ax_window_unresolved` → re-list with `list_windows {pid}`); `tree_format:"elements"`
+  with `max_elements:11` missed the text area because the menu bar is walked first (a
+  `query:"AXTextArea|labhand"` read returned the value); the sheet query
+  `Delete|Save|Cancel|keep` also matched the menu bar (383 rows); `/usr/bin/python3` has no
+  PyObjC (the probe used ctypes).
+- **Negative check** (`~/.ccbridge/reviews/mac-e2e/CONTROL.md`): a task **without**
+  `--allow-mac` found no `labhand-mac` tool (`ToolSearch` for `labhand-mac`,
+  `+labhand-mac`, `labhand_mac`: no match) and no `labhand-mac` entry in the scratch
+  repo's `.mcp.json` or `.claude/settings.local.json`.
+- **Consequence for the argv:** because Claude Code loads the definitions on demand, a
+  worker never pays the 41k-token `tools/list`. The default proxy argv (`cua-driver mcp`,
+  `LABHAND_MAC_MCP_COMMAND` unset) is kept; the policy-file routes in §4 stay documented
+  as unneeded alternatives for a client that loads all schemas up front.
+
 ## 7. Troubleshooting
 
 | symptom | cause / fix |

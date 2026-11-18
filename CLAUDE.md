@@ -151,6 +151,9 @@ not by labhand's Python code. Full guide: `docs/MAC-HOST.md`; worker skill: `mac
   private daemon: docs/MAC-HOST.md §4). Observe with `include_screenshot:false`, narrow with
   `query` / `max_elements`, re-read with `since:"latest"`; the tree is repeated in
   `structuredContent`, so a result is ~2x its text.
+- **Deferred definitions (live E2E 2026-11-19):** Claude Code shows the 61 tools by name only;
+  load just the step's tools in one `ToolSearch select:` call (never the whole list), so the
+  default argv needs no policy filter (docs/MAC-HOST.md §6b).
 - **Permissions:** CuaDriver.app's daemon holds Accessibility + Screen Recording and
   `cua-driver mcp` proxies to it. Residual (Ve's choice): `/usr/local/bin/node` (Desktop
   Commander, responsible process of every ccbridge worker) also holds Accessibility + Screen
