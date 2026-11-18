@@ -172,6 +172,11 @@ refuses only three disk-wrecking commands (recursive delete of `/`, `mkfs` / `di
 `format X:`); the boundary is the lab's network isolation
 ([docs/LAB-ISOLATION.md](docs/LAB-ISOLATION.md)).
 
+The lab Mac itself is a second, separate MCP server, `labhand-mac`: [Cua Driver](https://github.com/trycua/cua)
+(MIT) pinned to `cua-driver-rs-v0.53.2`, installed and checked by
+`scripts/install_cua_driver.py`. Install, permissions, tool budget and the
+`LABHAND_MAC_MCP_COMMAND` argv: [docs/MAC-HOST.md](docs/MAC-HOST.md).
+
 ## Skills
 
 `skills/<name>/SKILL.md` holds the agent skills that go with the lab — `binary-analysis`
