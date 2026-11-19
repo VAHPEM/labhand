@@ -263,6 +263,99 @@ First run through the real bridge (`~/.ccbridge/reviews/mac-e2e/E2E.md`, raw
   `LABHAND_MAC_MCP_COMMAND` unset) is kept; the policy-file routes in §4 stay documented
   as unneeded alternatives for a client that loads all schemas up front.
 
+## 6c. Mac trials (2026-11-19)
+
+Five harder live trials after the E2E, each by a ccbridge `--allow-mac` worker driving the Mac only
+through `mcp__labhand-mac__*` (Cua Driver 0.53.2, macOS 15 arm64); the shell only read state.
+Raw detail (every call, failure and workaround): `~/.ccbridge/reviews/mac-trials/s1..s5/REPORT.md`
+(not in this repo). The rules a worker needs are in the `mac-host` skill; this section keeps the
+numbers and the reasons.
+
+| trial | what it tested | result | `labhand-mac` calls | screenshots | front app changed | cursor moved | wall time |
+|---|---|---|---|---|---|---|---|
+| S1 | TextEdit: typing, selecting, Bold via menus only; save panel with Go to Folder; Finder rename | done, with workarounds (bold font and file verified by AX and checker) | 64 (7 errors/refusals) | 2 | yes: Chrome → TextEdit (`bring_to_front` for Format menu), left so | no | ~7.7 min |
+| S2 | Calculator by 12 element presses (12345×6789), Cmd+C to clipboard, Cmd+V into TextEdit, two-window layout | done (background Cmd+C failed, foreground worked) | 24 | 0 | no lasting change (brief flash during foreground hotkeys not measured); a shell `ls` of a sandbox container raised a consent prompt afterwards | no | ~2.8 min |
+| S3 | Chess: three moves by background drag, background click-click, foreground drag; Game Log read-back; save as PGN | done; all moves landed | 45 (3 errors) | 3 | yes during the run (`bring_to_front` for Moves menu); Terminal again after quitting | yes, only by the foreground `drag`, left at the drop point | ~5 min 13 s |
+| S4 | Activity Monitor: tabs, sort by Memory, top 5 rows, toolbar search, View switch, restore | done (View > All Processes needed to find a system process) | 31 | 0 | no | moved between the two samples, but no pixel or foreground action ran: not attributed (not measured) | ~4.5 min |
+| S5 | Preview: open panel + Go to Folder, Tools > Rotate Left, Adjust Size sheet (popup, checkboxes, width), export as JPEG, revert the source | done, with workarounds (scratch document to get a window; `kill_app` at the end) | 78 | 4 | not measured (the person was using the Mac; foreground flashes not probed) | not measured per action (the person's own mouse use masks it) | ~8 min |
+
+### Why the workarounds work
+
+- **Disabled menus.** macOS greys out some items while their app is inactive (TextEdit Format >
+  Font, Chess Moves). `invoke_menu` walks the real menu by AX and finds the item disabled.
+  `delivery_mode:"foreground"` only changes how input events are posted; it does not activate the
+  app, so the item stays disabled (S1). `bring_to_front` activates the app, after which the item
+  and the following menus work, and the app stays frontmost. Menus that macOS leaves enabled
+  (Finder File/Go, Activity Monitor View, Preview Tools/File) work in the background, also on a
+  window that is not key (S1, S4, S5); the old "needs the key/main window" line is corrected.
+  `window_not_key` came only from a `launch_app` placeholder id, and the error names the real
+  focused window (S2).
+- **Background hotkeys.** A background `hotkey` was posted as `route:"synthetic_events"`,
+  `effect:"unverifiable"`; Calculator ignored Cmd+C (clipboard empty, S2), and the save panel
+  ignored Cmd+Shift+G (S1, S3). Foreground delivery posts through `route:"global_input"` (HID
+  tap) to the briefly fronted window and the prior app is restored; in S2 the cursor and front app
+  read unchanged afterwards.
+- **Panel process structure.** The open/save panel is hosted by
+  `com.apple.appkit.xpc.openAndSavePanelService`, a separate process. Its own window is listed
+  `is_on_screen:false` (S1) or resolves to an empty tree (`ax_window_unresolved`, S5). The panel's
+  AX is bridged into the host app: the host's `list_windows` shows the sheet as its own window
+  ("Save", "Open" id=open-panel, `AXSheet (export)` id=save-panel), `get_window_state` on it
+  returns the full tree, and element tokens from it work for `set_value` and `click`. S1 read the
+  same `AXFocusedUIElement` from the host pid and the service pid. Because the controls are
+  remote, keystrokes do not land in the Go to Folder `PathTextField` (S1: `type_text` delivered 0
+  of 34 chars, background and foreground); `set_value` does. Return needs foreground (S1, S3, S5);
+  AXConfirm and a background Return did nothing. In S1 Return also failed until AX focus moved
+  from the `GoToWindow` sheet to the field (a `type_text` on the field moved it, though it
+  delivered nothing). In S5 keys reached the open panel only after a background pixel click on
+  an empty area of its file list. Finder's own Go to sheet (not the panel) had the field focused
+  and took a background Return (S1).
+- **Pixel click vs drag.** A background pixel `click` over an AX element is hit-tested and sent as
+  `AXPress` (S3: "PX hit-test pressed the background element via AX"), so it is no mouse test.
+  A background `drag` is posted as synthetic events to the window and landed on Chess's board
+  with another app frontmost; a foreground `drag` moves the real pointer and leaves it at the drop
+  point (screen 716,590 → 611,516 in S3, front app restored).
+- **Chess coordinates.** The board is a 3D perspective view; AX square frames had usable x but
+  flipped y (rank 1 smallest). S3 took rank rows and file edges from one PNG screenshot (1366×1059
+  px for an 1111×861 pt window, scale ≈1.23) and checked each move by AX (square labels like
+  "white pawn, e4"). Chess exposes 64 square `AXButton`s, so state is readable by AX.
+- **Windowless apps.** `launch_app` without URLs gave Preview no window at all; `invoke_menu`,
+  `hotkey` and `bring_to_front` all need one, so the menu bar was unreachable until a scratch
+  document was opened by URL (S5). A running windowless TextEdit instead opened an Untitled
+  document but returned only placeholder ids (S2). An app left windowless refuses `invoke_menu`
+  and pid-targeted `hotkey`; Chess, being frontmost, quit with `hotkey cmd+q scope:"desktop"`
+  (S3); for Preview a pid `hotkey cmd+q` was refused ("No eligible top-level windows") and only `kill_app` (SIGKILL) was left (S5). Calculator quits with its last window
+  (S2).
+- **Preview revert.** Preview autosaved the rotate and resize into the source within seconds
+  (S5); File > Revert To > "Last Opened — Today, HH:MM" (full dynamic title) plus `Revert` in the
+  alert sheet restored the original size and mtime.
+- **Shell ground truth.** `ls ~/Library/Containers/com.apple.TextEdit/...` from the worker's
+  shell hung >120 s and left `UserNotificationCenter` frontmost, most likely a privacy consent
+  prompt on the person's screen (S2). Read-only AX attribute reads through pyobjc in
+  `~/venvs/lab/bin/python` (`AXSelectedTextRange`, `AXAttributedStringForRange`,
+  `AXFocusedUIElement`) raised nothing and verified selection and the bold run (S1).
+- **Locale.** The Mac shows decimal commas and dot thousands separators (`16,00 GB`, `572,9 MB`,
+  `1.006`); a US-format parser misreads them (S4). Calculator's AX value starts with U+200E; the
+  copied clipboard text does not (S2).
+
+### Measured AX read sizes (S4, Activity Monitor, characters estimated from response length)
+
+| read shape | returned | approx. chars |
+|---|---|---|
+| `max_depth:5, max_elements:150`, markdown, no query | 5 complete rows, bottom stats panel, toolbar, menu bar | ~3.5k |
+| `max_depth:5, max_elements:200`, markdown, search filtered to 1 row | that row with all 10 cells | ~3k |
+| `max_depth:1, query:"GB\|MB\|Memory"`, elements | bottom stats panel only | ~2.5k |
+| `max_depth:3-4`, role query, elements | tab segments + search field with tokens | ~2.5-3k |
+| `max_depth:8, query:" MB"`, elements | 138 rows + 138 memory cells | ~70k |
+| `max_depth:4/5, max_elements:70-80`, markdown | toolbar, menu bar, at most 1 row without cells | ~2.5k |
+
+The window walk reported ~500-2,700 nodes. A `query` read always walked a 2,000-node budget
+whatever `max_elements` said, and the table rows came first, so a role query for the toolbar
+returned 0 matches; `max_depth:3, max_elements:8000, timeout_ms:10000` walked all 563 nodes and
+found it. With `max_elements` 40 or 120 the rows came back without cells, with 150 or 200 with
+cells. Menu-word queries cost the most elsewhere: `Cancel`/`Log` returned ~180 menu-bar rows
+(~6k tokens, S3), `Cancel` on a Preview window 390 rows (S5), and `max_depth:4` did not stop
+`Delete|Don|Cancel|Save` from returning 180 menu rows (S2).
+
 ## 7. Troubleshooting
 
 | symptom | cause / fix |
@@ -276,7 +369,8 @@ First run through the real bridge (`~/.ccbridge/reviews/mac-e2e/E2E.md`, raw
 | `screenshot_context_missing` | pixel click without a screenshot in the same session: observe with a screenshot first, same `session` |
 | `ax_unresolved` / empty tree right after File > New | the window is still appearing: wait ~1.5 s, observe again |
 | `hotkey` (e.g. cmd+w) does nothing | the window is on another Space / not key: press its close button by element instead |
-| `invoke_menu` fails | it needs the target window to be the key/main window |
+| `invoke_menu`: `path segment N is disabled while the app is in the background` | `bring_to_front` the window first (the app stays frontmost); `delivery_mode:"foreground"` does not help (§6c) |
+| `invoke_menu`: `window_not_key … focused=Some(N)` | you passed a placeholder id; use window `N` from the message |
 | an app came to the front unexpectedly | `launch_app` with a document URL activates the app; launch without URLs, then open the document another way |
 | `security_prompt_protected` | input would land on a macOS security / consent prompt; that is the person's call |
 | daemon questions | `cua-driver status` (socket, pid, permission mode, policies), `cua-driver doctor` |
