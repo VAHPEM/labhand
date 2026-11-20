@@ -23,7 +23,8 @@ EXPECTED_TOOLS = {
     "run_cmd", "run_script", "read_file", "job_start", "job_poll",
     "win_windows", "win_screenshot", "win_gui_run", "win_frida", "win_ui_tree",
     "win_ui_click", "win_ui_type", "win_key", "win_ui_seq",
-    "linux_gui_run", "linux_gdb", "linux_capa", "linux_yara", "linux_vol", "upload_file", "download_file",
+    "linux_gui_run", "linux_gdb", "linux_ghidra", "linux_capa", "linux_yara", "linux_vol", "upload_file",
+    "download_file",
     "vm_status", "vm_start", "vm_stop", "vm_revert", "vm_snapshot",
 }
 READ_ONLY = {"read_file", "win_windows", "win_screenshot", "win_ui_tree", "vm_status",

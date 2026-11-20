@@ -226,6 +226,22 @@ def linux_gdb(prog: str, script: str, args: str = "", gui: bool = True,
                                  max_lines=max_lines, timeout=timeout, host=host))
 
 
+@mcp.tool(annotations=_act("Run Ghidra headless (analyzeHeadless) on a binary (Linux host)"))
+def linux_ghidra(path: str, script: str = "", script_name: str = "labhand_ghidra.py",
+                 script_args: list[str] | None = None, analyze: bool = True,
+                 timeout: int = 300, extra: str = "", host: str | None = None):
+    """Run Ghidra's analyzeHeadless on a linux host: import `path` (relative to the host
+    workdir) into a throw-away read-only project, analyse it (analyze=false: -noanalysis)
+    and run `script` as the post-script `script_name` (its extension picks Ghidra's script
+    language: `.py` = Python 3 under PyGhidra, needs pyghidra importable on the host, else
+    ok=false; `.java` = GhidraScript class; Ghidra 12 has no Jython) with `script_args`. Returns the RAW Ghidra log + script output (text: prefer
+    this over driving Ghidra's GUI by screenshots). No interpretation; Ghidra is never
+    installed by labhand. Runs arbitrary caller code, so it is not read-only."""
+    return _emit(linux.linux_ghidra(path, script=script, script_name=script_name,
+                                    script_args=tuple(script_args or ()), analyze=analyze,
+                                    host=host, timeout=timeout, extra=extra))
+
+
 # --- Linux: capability triage (raw output; the Brain interprets) ------------
 @mcp.tool(annotations=_observe("Run capa on a sample (Linux host)"))
 def linux_capa(path: str, timeout: int = 120, extra: str = "", host: str | None = None):

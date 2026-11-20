@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""labhand.linux — Linux-host tools: a GUI program under Xvfb, scripted gdb, capa / YARA / YARA-X / Volatility 3 (raw output)."""
-import re, shlex
+"""labhand.linux — Linux-host tools: a GUI program under Xvfb, scripted gdb, capa / YARA / YARA-X / Volatility 3, Ghidra headless (raw output)."""
+import base64, re, shlex, uuid
 from . import remote, hosts
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
 from ._result import VMResult, _spill, _find_match  # noqa
 from .safety import _security_block
 from .images import _prepare_image
-from .shell import _run_and_wrap
+from .shell import _run_and_wrap, _wrap_cmd, _peel_rc, _peel_newfiles
 
 
 def linux_gui_run(command, wait=5, screen="1280x800x24", timeout=60, host=None):
@@ -352,3 +352,311 @@ def linux_vol(image, plugin, host=None, timeout=300, extra="", vol_opts=""):
            + shlex.quote(str(plugin)) + (" " + opts if opts else ""))
     res = _run_and_wrap(cmd, h.name, timeout, f"vol {str(plugin)[:30]} {str(image)[:30]}")
     return _missing_tool_note(res, "vol", "pipx install volatility3")
+
+
+# --- Linux: Ghidra headless (analyzeHeadless) ----------------------------------------
+# The text route into Ghidra: import one binary into a throw-away project, analyse it
+# (unless analyze=False) and run the caller's post-script; the raw Ghidra log + script
+# output comes back. No interpretation. Everything a call creates lives in ONE per-call
+# directory `<workdir>/_lh_ghidra_<uuid>/` (proj/ = the project, scripts/ = the script) that
+# the remote shell removes on every path: the cleanup runs OUTSIDE the inner `timeout`
+# that kills analyzeHeadless + its java (GNU timeout puts them in their own process group
+# and signals the whole group), so a killed run is still cleaned up. The project is opened
+# -readOnly and created with -deleteProject, so nothing is saved and the sample is untouched.
+
+# Where analyzeHeadless is looked for after `command -v analyzeHeadless`.
+GHIDRA_HEADLESS_CANDIDATES = (
+    "/usr/share/ghidra/support/analyzeHeadless",     # Kali / Debian package `ghidra`
+    "/opt/ghidra/support/analyzeHeadless",
+)
+GHIDRA_OVERRIDE_KEY = "GHIDRA_HEADLESS"              # inventory key <NAME>_GHIDRA_HEADLESS
+GHIDRA_SCRIPT_MAX = 64 * 1024                        # bytes; the script travels in the command line
+_GHIDRA_SCRIPT_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*\.[A-Za-z0-9]+$")
+# analyzeHeadless takes post-script arguments until the next word that is one of ITS options
+# (AnalyzeHeadless.Arg.matches: equalsIgnoreCase, plus any "-loader-..." word), so such a word
+# cannot be passed as a script argument: it would be read as a Ghidra option. Refused instead.
+_GHIDRA_OPTIONS = frozenset(o.lower() for o in (
+    "-import", "-process", "-prescript", "-postscript", "-scriptPath", "-propertiesPath",
+    "-scriptlog", "-log", "-overwrite", "-recursive", "-readOnly", "-deleteproject",
+    "-noanalysis", "-processor", "-cspec", "-analysisTimeoutPerFile", "-keystore", "-connect",
+    "-p", "-commit", "-okToDelete", "-max-cpu", "-librarySearchPaths", "-loader"))
+_GH_PATH_RE = re.compile(r"^__LH_GHIDRA_PATH__=(.*)$", re.M)
+_GH_VER_RE = re.compile(r"^__LH_GHIDRA_VERSION__=(.*)$", re.M)
+_GH_RC_RE = re.compile(r"^__LH_GHIDRA_RC__=(\d+) elapsed=(\d+)$", re.M)
+_GH_PYG_RE = re.compile(r"^__LH_GHIDRA_PYGHIDRA__=(.*)$", re.M)
+# A .py post-script runs under PyGhidra. Ghidra 12 has no built-in Jython, and plain
+# analyzeHeadless does not start PyGhidra (measured on Kali, Ghidra 12.1.3, 2026-11-20:
+# JythonStubException / "Ghidra was not started with PyGhidra"). Ghidra's own launcher
+# (support/pyghidraRun -> pyghidra_launcher.py) may create a venv and offers pip installs and
+# upgrades, so it is NOT used: labhand runs the command that launcher ends with, after
+# checking that python3 can import pyghidra (else raw ok=False; labhand never installs).
+# `-P` (Python >= 3.11; Kali: 3.14.7, measured 2026-11-20): the cwd is the samples workdir,
+# which holds untrusted material, and `-c` / `-m` would put it FIRST on sys.path, so a planted
+# `pyghidra/` (or `logging.py`, `jpype/`, ...) there would be imported and run. With -P nothing
+# is imported from the cwd; an older python3 rejects -P and the import check fails (ok=False).
+# Not -I: that also drops the user site, where Kali's pyghidra lives (~/.local/lib/python3.14).
+_PYGHIDRA_LAUNCH = ('python3 -P -m pyghidra.ghidra_launch --install-dir "$__ghi" '
+                    "ghidra.app.util.headless.AnalyzeHeadless")
+# One line out either way: the version + interpreter, or the import error as `Type: message`
+# (the traceback of a `-c` one-liner only adds `File "<string>", line 1`).
+_PYGHIDRA_CHECK = ("import sys\n"
+                   "try:\n"
+                   "    import pyghidra\n"
+                   "except BaseException as e:\n"
+                   "    print(type(e).__name__ + ': ' + str(e)); sys.exit(1)\n"
+                   "print(getattr(pyghidra, '__version__', '?'), sys.executable)")
+_PYGHIDRA_CHECK_T = 60               # s; the import check runs before (and besides) `timeout`
+_GHIDRA_KILL_GRACE = 5               # s; `timeout -k` grace after SIGTERM
+# Ghidra compiles a .java post-script into an OSGi bundle OUTSIDE the per-call dir:
+# <user settings>/osgi/compiled-bundles/<Integer.toHexString(scriptDir.getAbsolutePath()
+# .hashCode())>/ (measured on Kali, Ghidra 12.1.3, 2026-11-20: script dir
+# /home/vahpem/samples/_lh_ghidra_35ef4d5a415e458b99148e79020d889b/scripts -> f851c098). The
+# per-call script dir makes that name unique per call, so the EXIT trap computes it with
+# this bash port of Java's String.hashCode (exact for ASCII paths; the uuid part always is)
+# and removes the bundle if it was written during this call (newer than the call's stamp).
+_GHIDRA_JHASH_FN = ("__lh_jh() { local s=$1 h=0 i c; for ((i=0; i<${#s}; i++)); do "
+                    "printf -v c '%d' \"'${s:i:1}\"; h=$(( (h*31 + c) & 0xffffffff )); done; "
+                    "printf '%x' \"$h\"; }")
+_GHIDRA_BUNDLE_ROOTS = ('"${XDG_CONFIG_HOME:-$HOME/.config}"/ghidra/*/osgi/compiled-bundles',
+                        '"$HOME"/.ghidra/*/osgi/compiled-bundles')
+
+
+def _ghidra_uses_pyghidra(script, script_name):
+    return bool(script) and script_name.lower().endswith(".py")
+
+
+def _ghidra_backstop(timeout, pyg):
+    """The outer (_wrap_cmd) timeout. It only fires if the shell itself hangs, so it must be
+    longer than everything the block bounds itself: the PyGhidra import check (+ grace) and
+    the inner `timeout` (+ grace), plus slack for the locate / write / cleanup steps. Were it
+    shorter, it would kill the wrapper while the inner GNU timeout (its own process group)
+    keeps java running, and the EXIT trap would remove the dir under a running Ghidra."""
+    pre = (_PYGHIDRA_CHECK_T + _GHIDRA_KILL_GRACE) if pyg else 0
+    return pre + int(timeout) + _GHIDRA_KILL_GRACE + 30
+
+
+def _ghidra_block(path, script, script_name, script_args, analyze, timeout, opts,
+                  override, call_dir, key="<NAME>_" + GHIDRA_OVERRIDE_KEY):
+    """The bash block linux_ghidra runs (in the host workdir, inside _wrap_cmd's backstop).
+    Every caller word is shlex-quoted; the script text travels base64-encoded."""
+    cands = " ".join(shlex.quote(c) for c in GHIDRA_HEADLESS_CANDIDATES)
+    pyg = _ghidra_uses_pyghidra(script, script_name)
+    lines = [
+        "(",
+        f"__lh_d={call_dir}",
+        # removes the per-call dir (and the compiled bundle of its script dir) on EVERY exit
+        # of this subshell (success, Ghidra error, script error, inner timeout); the inner
+        # `timeout` never signals this shell
+        "__lh_sd=",
+        _GHIDRA_JHASH_FN,
+        "__lh_cleanup() {",
+        '  if [ -n "$__lh_sd" ] && [ -e "$__lh_d/stamp" ]; then',
+        '    __lh_h=$(__lh_jh "$__lh_sd")',
+        '    [ -n "$__lh_h" ] &&',      # never an empty name: that would be compiled-bundles/ itself
+        "    for __lh_b in " + " ".join(r + '/"$__lh_h"' for r in _GHIDRA_BUNDLE_ROOTS) + "; do",
+        '      [ -d "$__lh_b" ] && [ -n "$(find "$__lh_b" -maxdepth 0 -newer "$__lh_d/stamp" '
+        '2>/dev/null)" ] && rm -rf -- "$__lh_b"',
+        "    done",
+        "  fi",
+        '  rm -rf -- "$__lh_d"',
+        "}",
+        "trap __lh_cleanup EXIT",
+        f"__gh={shlex.quote(override)}",
+        'if [ -n "$__gh" ]; then',
+        '  [ -f "$__gh" ] && [ -x "$__gh" ] || { echo "linux_ghidra: '
+        f'{key}=$__gh is not an executable file"; exit 127; }}',
+        "else",
+        "  __gh=$(command -v analyzeHeadless 2>/dev/null)",
+        '  if [ -z "$__gh" ]; then',
+        f'    for __c in {cands}; do [ -x "$__c" ] && {{ __gh=$__c; break; }}; done',
+        "  fi",
+        '  [ -n "$__gh" ] || { echo "analyzeHeadless: not found (not on PATH, not at '
+        + " ".join(GHIDRA_HEADLESS_CANDIDATES).replace('"', "")
+        + f'; set {key} to its absolute path)"; exit 127; }}',
+        "fi",
+        '__ghr=$(readlink -f -- "$__gh" 2>/dev/null || echo "$__gh")',
+        "__ghv=$(sed -n 's/^application\\.version=//p' "
+        '"${__ghr%/*}/../Ghidra/application.properties" 2>/dev/null | head -1)',
+        'echo "__LH_GHIDRA_PATH__=$__gh"',
+        'echo "__LH_GHIDRA_VERSION__=$__ghv"',
+    ]
+    if pyg:
+        lines += [
+            # the Ghidra install dir = the parent of support/ that holds analyzeHeadless
+            '__ghi=$(cd -- "${__ghr%/*}/.." 2>/dev/null && pwd -P)',
+            f"__pyv=$(timeout -k {_GHIDRA_KILL_GRACE} {_PYGHIDRA_CHECK_T} python3 -P -c "
+            f"{shlex.quote(_PYGHIDRA_CHECK)} </dev/null 2>&1)",
+            'if [ $? -ne 0 ] || [ -z "$__ghi" ]; then',
+            "  echo \"linux_ghidra: a .py post-script runs under PyGhidra, but \\`python3 -P -c "
+            "'import pyghidra'\\` failed on this host (Ghidra install dir: '$__ghi'). labhand "
+            "never installs it: write the post-script in Java (.java), or install PyGhidra "
+            "on the host yourself.\"",
+            '  printf \'%s\\n\' "$__pyv" | tail -n 5',
+            "  exit 127",
+            "fi",
+            'echo "__LH_GHIDRA_PYGHIDRA__=$__pyv"',
+        ]
+    lines.append('mkdir -p -- "$__lh_d/proj" "$__lh_d/scripts" || exit 1')
+    argv = ['"$PWD/$__lh_d/proj"', "p", "-import", _q_path(path), "-deleteProject", "-readOnly"]
+    if not analyze:
+        argv.append("-noanalysis")
+    if opts:
+        argv.append(opts)
+    if script:
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        lines.append(f'printf %s {b64} | base64 -d > "$__lh_d/scripts/{script_name}" || exit 1')
+        lines.append('__lh_sd="$PWD/$__lh_d/scripts"; : > "$__lh_d/stamp" || exit 1')
+        argv += ["-scriptPath", '"$PWD/$__lh_d/scripts"', "-postScript", script_name]
+        argv += [shlex.quote(a) for a in script_args]
+    lines += [
+        "__t0=$SECONDS",
+        f"timeout -k {_GHIDRA_KILL_GRACE} {int(timeout)} " + (_PYGHIDRA_LAUNCH if pyg else '"$__gh"') + " "
+        + " ".join(argv) + " </dev/null 2>&1",
+        "__g=$?",
+        'echo "__LH_GHIDRA_RC__=$__g elapsed=$((SECONDS-__t0))"',
+        "exit $__g",
+        ")",
+    ]
+    return "\n".join(lines)
+
+
+def linux_ghidra(path, script="", script_name="labhand_ghidra.py", script_args=(),
+                 analyze=True, host=None, timeout=300, extra=""):
+    """Run Ghidra's analyzeHeadless on a linux host: import `path` (relative to the host
+    workdir) into a fresh per-call project, analyse it unless analyze=False (-noanalysis),
+    and when `script` is non-empty run it as the post-script `script_name` with
+    `script_args`. Returns the RAW combined output (Ghidra log + script output); no
+    interpretation. The project is read-only and deleted; the per-call dirs are removed on
+    every path; `timeout` kills analyzeHeadless and its java. Ghidra is located through
+    <NAME>_GHIDRA_HEADLESS (inventory), else `command -v analyzeHeadless`, else
+    GHIDRA_HEADLESS_CANDIDATES; not found -> ok=False with the raw reason. labhand never
+    installs Ghidra.
+
+    Script language: `.java` (and anything else but `.py`) runs under analyzeHeadless; a
+    `.py` post-script runs under PyGhidra (`python3 -P -m pyghidra.ghidra_launch ...
+    AnalyzeHeadless`, same arguments) after checking that python3 can import pyghidra -
+    not importable -> ok=False with the raw error, nothing installed. Measured on Kali,
+    Ghidra 12.1.3, 2026-11-20: plain analyzeHeadless cannot run a .py at all (no Jython ->
+    JythonStubException; `# @runtime PyGhidra` -> "Ghidra was not started with PyGhidra",
+    exit still 0)."""
+    h, err = hosts.check(host, "linux_ghidra", "linux")
+    if err:
+        return err
+    host = h.name
+    if not str(path or "").strip():
+        return VMResult(False, "linux_ghidra: `path` is empty - name the binary in the host workdir")
+    script = "" if script is None else str(script)
+    script_name = str(script_name or "")
+    if script and (not _GHIDRA_SCRIPT_NAME.match(script_name) or len(script_name) > 128):
+        return VMResult(False, f"linux_ghidra: bad `script_name` {script_name[:60]!r}: letters, "
+                                 "digits and '._-' only, not starting with '.' or '-', with an "
+                                 "extension (.py, .java, ...) that picks Ghidra's script language")
+    if isinstance(script_args, (list, tuple)):
+        args = [str(a) for a in script_args]
+    else:
+        try:
+            args = shlex.split(str(script_args or ""))
+        except ValueError as e:
+            return VMResult(False, f"linux_ghidra: could not split `script_args` into words ({e})")
+    clash = [a for a in args if a.lower() in _GHIDRA_OPTIONS or a.startswith("-loader-")]
+    if clash:
+        return VMResult(False, f"linux_ghidra: script argument(s) {clash[:3]} are analyzeHeadless "
+                                 "options, so Ghidra would read them as options, not as script "
+                                 "arguments; encode them differently")
+    try:
+        script_bytes = script.encode("utf-8")
+    except UnicodeEncodeError as e:  # e.g. a lone surrogate from a JSON "\ud800"
+        return VMResult(False, f"linux_ghidra: `script` is not valid UTF-8 text ({e})")
+    if script and len(script_bytes) > GHIDRA_SCRIPT_MAX:
+        return VMResult(False, f"linux_ghidra: `script` is {len(script_bytes)} bytes; "
+                                 f"the limit is {GHIDRA_SCRIPT_MAX} (it travels in the command line)")
+    if not script and args:
+        return VMResult(False, "linux_ghidra: `script_args` given but `script` is empty")
+    blocked = _security_block(script) if script else None
+    if blocked:
+        return VMResult(False, f"linux_ghidra: refused - {blocked}")
+    timeout = _int_timeout(timeout, 300)
+    try:
+        opts = _q_extra(extra)
+    except ValueError as e:          # e.g. an unbalanced quote in `extra`
+        return VMResult(False, f"linux_ghidra: could not split `extra` into words ({e})")
+    override = hosts.setting(host, GHIDRA_OVERRIDE_KEY)
+    if override and not override.startswith("/"):
+        return VMResult(False, f"linux_ghidra: {hosts.prefix(host)}_{GHIDRA_OVERRIDE_KEY}="
+                                 f"{override!r} must be an absolute path to analyzeHeadless")
+
+    call_dir = "_lh_ghidra_" + uuid.uuid4().hex
+    block = _ghidra_block(path, script, script_name, args, bool(analyze), timeout, opts,
+                          override, call_dir, key=f"{hosts.prefix(host)}_{GHIDRA_OVERRIDE_KEY}")
+    backstop = _ghidra_backstop(timeout, _ghidra_uses_pyghidra(script, script_name))
+    label = f"ghidra {str(path)[:60]}"
+    try:
+        out, errtxt = remote.ssh_exec(_wrap_cmd(block, host, backstop), host=host,
+                                      read_timeout=backstop + 25)
+    except Exception as e:  # noqa: BLE001 - a connection failure is a result, not a crash
+        return VMResult(False, f"linux_ghidra: could not run on {host}: {type(e).__name__}: {e}")
+    combined = ((out or "") + (("\n" + errtxt) if (errtxt or "").strip() else "")).strip()
+    combined, rc_outer = _peel_rc(combined)
+    # Only remote.ssh_exec's own read-timeout note (appended to the stderr it returns) and a
+    # missing __RC marker mean a dead channel; the same words in Ghidra / script output do not.
+    channel_dead = rc_outer is None and "(TIMEOUT after" in (errtxt or "")
+    combined, newfiles = _peel_newfiles(combined)
+
+    gh_path = gh_ver = gh_pyg = None
+    m = _GH_PYG_RE.search(combined)           # printed BEFORE Ghidra runs: first occurrence
+    if m:
+        gh_pyg = m.group(1).strip()
+        combined = combined[:m.start()] + combined[m.end() + 1:]
+    m = _GH_PATH_RE.search(combined)          # printed BEFORE Ghidra runs: first occurrence
+    if m:
+        gh_path = m.group(1).strip()
+        combined = combined[:m.start()] + combined[m.end() + 1:]
+    m = _GH_VER_RE.search(combined)
+    if m:
+        gh_ver = m.group(1).strip()
+        combined = combined[:m.start()] + combined[m.end() + 1:]
+    rc = elapsed = None
+    ms = list(_GH_RC_RE.finditer(combined))   # printed AFTER Ghidra: last occurrence
+    if ms:
+        m = ms[-1]
+        rc, elapsed = int(m.group(1)), int(m.group(2))
+        combined = combined[:m.start()] + combined[m.end():]
+    combined = combined.strip()
+    if rc is None:
+        rc = rc_outer
+    # 124 = GNU timeout fired; 137 = it had to SIGKILL after the grace (only counted as the
+    # timeout when the run actually lasted that long, so an OOM kill is not relabelled).
+    timed_out = (channel_dead or rc_outer == 124 or rc == 124
+                 or (rc == 137 and elapsed is not None and elapsed >= timeout))
+    ok = (rc == 0) and not timed_out
+
+    text = combined or "(analyzeHeadless produced no output)"
+    try:
+        detail, saved = _spill(host, text, "ghidra")
+    except Exception as e:  # noqa: BLE001 - the run happened; do not lose its result
+        detail, saved = text[:4000] + f"\n[... output not spilled to the host: {e}]", None
+    if newfiles:                     # e.g. a post-script that exported into the workdir
+        detail += (f"\nFILES WRITTEN OR CHANGED in {_wd()}/ by this call: "
+                   + "; ".join(f"{fn} ({fsz} bytes)" for fn, fsz in newfiles[:8]))
+    flag = _find_match(text)
+    known = []
+    if gh_path:
+        known.append(f"analyzeHeadless: {gh_path}")
+    if gh_ver:
+        known.append(f"Ghidra version: {gh_ver}")
+    if gh_pyg:
+        known.append(f"PyGhidra (version, python): {gh_pyg}")
+    if rc is not None:
+        known.append(f"analyzeHeadless exit code: {rc}")
+    if elapsed is not None:
+        known.append(f"analyzeHeadless elapsed: {elapsed}s")
+    if saved:
+        known.append(f"linux_ghidra full output -> {saved} (page with read_file)")
+    why = (f"TIMEOUT (killed after {timeout}s - raise `timeout`, or analyze=False for a quick "
+           "look), " if timed_out else
+           "shell aborted before finishing, " if rc is None else
+           f"exit {rc}, " if rc != 0 else "")
+    return VMResult(ok, f"ran on {host}: {label} -> {why}{len(text)} chars"
+                        + ("; MATCH" if flag else ""),
+                    detail=f"[linux_ghidra @ {path}]\n" + detail, known=known,
+                    match=flag, info=detail)

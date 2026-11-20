@@ -21,7 +21,8 @@ or "task". The deciding Brain lives elsewhere — any agent that imports this pa
 
 - **Hosts are a named inventory** (`labhand/hosts.py`, example in `.env.example`):
   `LABHAND_HOSTS=kali,windows` and per host `<NAME>_HOST`, `<NAME>_USER`, `<NAME>_OS`
-  (`linux` | `windows`), optional `<NAME>_PYTHON`, `<NAME>_UTM_VM`. Without
+  (`linux` | `windows`), optional `<NAME>_PYTHON`, `<NAME>_UTM_VM`, `<NAME>_GHIDRA_HEADLESS`
+  (absolute path of `analyzeHeadless` on a linux host; overrides the lookup of `linux_ghidra`). Without
   `LABHAND_HOSTS` the old keys still work unchanged: `kali` from `KALI_HOST` /
   `KALI_USER` (+ `KALI_PYTHON`), `windows` from `WIN_HOST` / `WIN_USER` (+ `WIN_PYTHON_EXE`).
 - **Working directory** on every host: `LABHAND_WORKDIR` (default `samples`, relative to
@@ -110,6 +111,7 @@ connection. Every `win_*` / `linux_*` call below also takes `host=None`.
 |---|---|
 | `linux_gui_run(command, wait=5, screen="1280x800x24", timeout=60)` | run a GUI program on Kali under **Xvfb** and return a screenshot. |
 | `linux_gdb(prog, script, args="", gui=True, screen="1280x800x24", max_lines=800, timeout=120)` | run a **gdb-python** script against an ELF (ASLR off, PIE base fixed at `0x555555554000`); returns whatever it `log()`s. Helpers injected: `rd/wr/u64/u32/f64/reg/cstr/at/hook/starti/cont/run`. |
+| `linux_ghidra(path, script="", script_name="labhand_ghidra.py", script_args=(), analyze=True, host=None, timeout=300, extra="")` | run **Ghidra headless** (`analyzeHeadless`) on a linux host: import `path` (host workdir) into a fresh per-call project (`-deleteProject`, `-readOnly`: nothing saved, sample untouched), analyse unless `analyze=False` (`-noanalysis`), run `script` as post-script `script_name` (the extension picks the language: `.py` runs under **PyGhidra** via `python3 -P -m pyghidra.ghidra_launch` after an import check (`-P`: nothing is imported from the samples cwd; Python >= 3.11) - not importable → raw `ok=False`, never installed; anything else, e.g. `.java`, under analyzeHeadless itself. Ghidra 12 has no Jython, measured 2026-11-20) with `script_args`; **raw** Ghidra log + script output, `known` = analyzeHeadless path, Ghidra version, PyGhidra version + python (`.py`), exit code, elapsed. Per-call dirs `samples/_lh_ghidra_<uuid>/` and the OSGi bundle Ghidra compiles for that call's script dir (`~/.config/ghidra/*/osgi/compiled-bundles/<hash>`) removed on every path; tree-killing timeout. Located by `<NAME>_GHIDRA_HEADLESS` (inventory, absolute path), else `command -v analyzeHeadless`, else `/usr/share/ghidra/support/analyzeHeadless`, `/opt/ghidra/support/analyzeHeadless`. Not found → raw `ok=False`; labhand never installs. Prefer it over driving Ghidra's GUI by `linux_gui_run` screenshots. |
 | `linux_capa(path, host=None, timeout=120, extra="")` | run **capa** on a linux host against `path` (in the host workdir); returns capa's **raw** output. labhand only runs it — the analyst/Brain reads the MITRE ATT&CK / MBC mapping. Not installed → raw `ok=False`; labhand never installs. |
 | `linux_yara(rules, target, host=None, timeout=60, extra="")` | run **yara** (`rules` against `target`) on a linux host; **raw** output, no interpretation. Not installed → raw `ok=False`. |
 
