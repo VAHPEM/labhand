@@ -21,8 +21,13 @@ caller's.
 
 - **Cheap static survey:** `shell.run_cmd` for `file` / `xxd` / `strings` /
   `objdump` / `readelf` / `rabin2`; page a dumped blob with `shell.read_file`.
-- **Structure / decompile:** run Ghidra or radare2 through `shell.run_cmd`; read a
-  file a solver wrote on the VM back with `shell.read_file`.
+- **Structure / decompile:** Ghidra through `linux.linux_ghidra(path, script=...)`
+  (headless `analyzeHeadless`, text out: the post-script prints what you need, e.g.
+  functions, decompiled C, xrefs, strings), radare2 through `shell.run_cmd`; read a
+  file a solver wrote on the VM back with `shell.read_file`. Prefer `linux_ghidra` over
+  driving Ghidra's GUI through `linux_gui_run` screenshots: the GUI route costs an image
+  per step and pixel clicks; headless gives you the same data as text. See the Ghidra
+  headless note below.
 - **Go dynamic** (the moment two static looks stop answering - the two-dead-ends
   rule): Linux ELF -> `linux.linux_gdb` (scripted gdb, ASLR off, fixed PIE base);
   Windows -> `windows.win_frida` (inspect/replace a value, or drive the UI);
@@ -158,6 +163,27 @@ note is relevant to every challenge) ===
   the specific args (RCX/RDX...) at EACH hit; do not assume the first hit is
   the one you want.
 - IDA "graph too big — switching to text mode": normal, not a broken binary.
+- **Ghidra headless (`linux.linux_ghidra`).** One call = import into a throw-away,
+  read-only project (deleted afterwards; the sample is never modified), auto-analysis
+  (`analyze=False` skips it: much faster when you only need the loader's view: sections,
+  symbols, imports), then your post-script. Print what you need from the script (it
+  arrives in the raw output as `INFO  <script>> ...` lines); keep output targeted (one
+  function's decompilation, not every function) - large output spills to a VM file you
+  page with `read_file`. Analysis of a large binary takes minutes: set `timeout`
+  accordingly (a timed-out call is killed and cleaned up). `script_args` reach the script
+  through `getScriptArgs()`; a word that is itself an analyzeHeadless option (`-import`,
+  `-scriptPath`, ...) is refused because Ghidra would read it as an option. `extra` passes
+  raw analyzeHeadless options (e.g. `-processor <languageID>` for a raw blob).
+  **Script language:** a `.py` post-script (the default `script_name`) runs under
+  PyGhidra (Python 3; plain `print` lands in the raw output as bare lines, `known` names
+  the PyGhidra version); it needs `pyghidra` importable by the host's `python3`, else the
+  call is `ok=False` with the import error (labhand installs nothing). It runs as
+  `python3 -P`, so nothing is imported from samples/ (untrusted files live there): a
+  script cannot `import` a helper module from samples/; inline it. Ghidra 12 has no
+  Jython, so Jython-only syntax fails. `.java` (`class Foo extends GhidraScript`,
+  `println(...)`, file `Foo.java`) runs under analyzeHeadless itself. A script error does
+  not always fail the call (Ghidra can log `REPORT SCRIPT ERROR` and still exit 0): read
+  the log, not only `ok`.
 - Ghidra "Response buffer" / "Flow exceeded maximum instructions" errors on
   C++ linked against heavy header-only template libs (cpp-httplib, boost...):
   this identifies the binary type, it is not a config error. Read

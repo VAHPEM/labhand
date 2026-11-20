@@ -9,6 +9,7 @@ Read from the environment (the `.env` labhand loads):
     KALI_OS=linux                           # linux | windows
     KALI_PYTHON=/home/vahpem/venv/bin/python3   # optional: interpreter for run_script / jobs
     KALI_UTM_VM=Kali Linux                  # optional: the UTM VM name (snapshots)
+    KALI_GHIDRA_HEADLESS=/opt/g/support/analyzeHeadless  # optional, linux: for linux_ghidra (setting())
 
 <NAME> is the host name upper-cased, with `-` turned into `_` (`win-2` -> `WIN_2_HOST`).
 
@@ -82,6 +83,13 @@ def workdir_win():
 
 def prefix(name):
     return re.sub(r"[^A-Za-z0-9]", "_", name).upper()
+
+
+def setting(name, key, env=None):
+    """An optional per-host key `<NAME>_<KEY>` (e.g. KALI_GHIDRA_HEADLESS), stripped; "" when
+    unset. Read at call time, so it works for both the named and the pre-inventory layout."""
+    env = os.environ if env is None else env
+    return str(env.get(f"{prefix(name)}_{key}", "") or "").strip()
 
 
 def load(env=None):
