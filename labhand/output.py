@@ -52,15 +52,42 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
-def _spill_name(stem):
-    """`_{stem}_{time_ns}_{pid}_{rand8}.txt`: one path component made only of
-    LABHAND_WORKDIR's characters (letters, digits, `._-`), at most ~90 chars."""
-    stem = _STEM_BAD.sub("_", str(stem or ""))[:_STEM_MAX].strip(".") or "out"
-    stem = stem.replace("..", "_")
+def _clean_stem(stem, default="out"):
+    stem = _STEM_BAD.sub("_", str(stem or ""))[:_STEM_MAX].strip(".") or default
+    return stem.replace("..", "_")
+
+
+def _unique_token():
+    """`{time_ns}_{pid}_{rand8}`: unique per call, across threads and processes."""
     with _SPILL_LOCK:
         ns = max(time.time_ns(), _SPILL_LAST_NS[0] + 1)
         _SPILL_LAST_NS[0] = ns
-    return f"_{stem}_{ns}_{os.getpid()}_{secrets.token_hex(4)}.txt"
+    return f"{ns}_{os.getpid()}_{secrets.token_hex(4)}"
+
+
+def _spill_name(stem):
+    """`_{stem}_{time_ns}_{pid}_{rand8}.txt`: one path component made only of
+    LABHAND_WORKDIR's characters (letters, digits, `._-`), at most ~90 chars."""
+    return f"_{_clean_stem(stem)}_{_unique_token()}.txt"
+
+
+# Per-call SCRATCH files (a script, a command file, a launcher, a config, a screenshot)
+# share the spill scheme. Until 2026-11-20 they had FIXED names (`_script.sh`,
+# `_win_cmd.txt`, `_gdb_user.py`, `_frida.js`, ...): two labhand processes calling the same
+# host raced, B's write landing between A's write and A's exec, so A ran (and reported)
+# B's script. Every scratch name now starts with `_lh_` and ends with the unique token;
+# the caller removes the file after the call on every path (remote.remove_quiet).
+SCRATCH_PREFIX = "_lh_"
+SCRATCH_RE = re.compile(r"^_lh_[A-Za-z0-9._-]*?_\d{10,}_\d+_[0-9a-f]{8}(\.[A-Za-z0-9]+)?$")
+
+
+def scratch_name(stem, ext=""):
+    """`_lh_{stem}_{time_ns}_{pid}_{rand8}[.ext]`: a per-call scratch file name, one path
+    component of letters, digits and `._-` only, so it needs no quoting in bash, cmd.exe
+    or PowerShell (it is still quoted where a path is built)."""
+    ext = re.sub(r"[^A-Za-z0-9]", "", str(ext or ""))
+    return (f"{SCRATCH_PREFIX}{_clean_stem(stem, 'tmp')}_{_unique_token()}"
+            + (f".{ext}" if ext else ""))
 
 
 def _spill(host, text, stem="out"):

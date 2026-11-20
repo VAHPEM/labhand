@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """The named host inventory (labhand.hosts): parsing, the pre-inventory fallback, unknown
 hosts refused before any connection, and every tool branching on the host's OS."""
+import re
+
 import pytest
 
 from labhand import hosts, jobs, linux, remote, shell, windows
@@ -138,15 +140,19 @@ def test_run_script_uses_the_hosts_own_python_and_default_kind(inv, monkeypatch)
     inv(THREE)
     sent = []
     monkeypatch.setattr(remote, "write_remote", lambda p, c, host=None: None)
+    monkeypatch.setattr(remote, "remove_quiet", lambda names, host=None: None)
     monkeypatch.setattr(shell, "_run_and_wrap",
                         lambda invoke, host, timeout, label, grep_shape=None: sent.append((host, invoke))
                         or VMResult(True, "ok"))
     shell.run_script("print(1)", host="winbox", kind="python3")
     shell.run_script("echo", host="win-2")
     shell.run_script("print(1)", kind="python3")              # default host = first = lab1
-    assert sent[0] == ("winbox", r'"C:\Py\python.exe" _script.py')
+    # the script file is per call: _lh_script_<time_ns>_<pid>_<rand8>.py
+    assert re.fullmatch(r'"C:\\Py\\python\.exe" _lh_script_\d+_\d+_[0-9a-f]{8}\.py', sent[0][1])
+    assert sent[0][0] == "winbox"
     assert sent[1][1].startswith("powershell ")                # windows default kind
-    assert sent[2] == ("lab1", "python3 _script.py")
+    assert sent[2][0] == "lab1"
+    assert re.fullmatch(r"python3 _lh_script_\d+_\d+_[0-9a-f]{8}\.py", sent[2][1])
 
 
 def test_default_host_is_the_first_of_the_inventory(inv):
@@ -197,7 +203,7 @@ def test_pool_key_is_the_inventory_name(inv, monkeypatch):
         def close(self):
             pass
     monkeypatch.setattr(remote, "_POOL", {})
-    monkeypatch.setattr(remote, "_client", lambda addr, user: made.append((addr, user)) or FakeC())
+    monkeypatch.setattr(remote, "_client", lambda addr, user, **kw: made.append((addr, user)) or FakeC())
     a = remote._get("WinBox")
     b = remote._get("winbox")
     assert a is b and made == [("10.0.0.2", "u2")] and list(remote._POOL) == ["winbox"]

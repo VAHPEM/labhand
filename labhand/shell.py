@@ -4,7 +4,7 @@ import os, re, shlex, base64, shutil
 from . import remote, config, hosts
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
 from ._result import VMResult, SLICE, _spill, _save_to_host, _find_match  # noqa
-from .output import _clamp_page
+from .output import _clamp_page, SCRATCH_RE
 from .safety import _security_block
 
 
@@ -140,6 +140,11 @@ def read_file(path, offset=0, length=SLICE, host=None, pinned_docs=()):
                              "create it instead of reading the path again.")
 
 
+# SCRATCH_RE (labhand/output.py) as a POSIX ERE over a `name<TAB>size` snapshot line.
+_SCRATCH_LINE_ERE = (r"^_lh_[A-Za-z0-9._-]*_[0-9]{10,}_[0-9]+_[0-9a-f]{8}(\.[A-Za-z0-9]+)?"
+                     r"[[:space:]][0-9]+$")
+
+
 def _wrap_cmd(command, host, timeout=20):
     """Working dir + REAL timeout + exit-code marker.
 
@@ -179,7 +184,11 @@ def _wrap_cmd(command, host, timeout=20):
         + command + "\n"
         "__rc=$?\n"
         f"{snap} > /tmp/_post.$$ 2>/dev/null\n"
-        "comm -13 /tmp/_pre.$$ /tmp/_post.$$ 2>/dev/null | head -15 | "
+        # labhand's per-call scratch names (SCRATCH_RE, as `name<TAB>size`) are dropped
+        # BEFORE the 15-entry cut: concurrent calls' scratch files must not take the slots of
+        # a real new file of this command (review R2-C2, 2026-11-21).
+        "comm -13 /tmp/_pre.$$ /tmp/_post.$$ 2>/dev/null | "
+        f"grep -Ev {shlex.quote(_SCRATCH_LINE_ERE)} | head -15 | "
         "sed 's/^/__NEWFILE__ /'\n"
         "rm -f /tmp/_pre.$$ /tmp/_post.$$\n"
         "exit $__rc"
@@ -193,7 +202,10 @@ _NEWFILE_RE = re.compile(r"^__NEWFILE__ (.+?)\t(\d+)$", re.M)
 def _peel_newfiles(text):
     """Split the `__NEWFILE__ name\tsize` lines the wrapper appends off `text`.
     Returns (clean_text, [(name, size), ...])."""
-    found = [(m.group(1), int(m.group(2))) for m in _NEWFILE_RE.finditer(text or "")]
+    # labhand's own per-call scratch files (another call's script, launcher, ...) are
+    # not the command's output: leave them out.
+    found = [(m.group(1), int(m.group(2))) for m in _NEWFILE_RE.finditer(text or "")
+             if not SCRATCH_RE.match(m.group(1))]
     return (_NEWFILE_RE.sub("", text or "").rstrip(), found)
 
 
@@ -576,8 +588,11 @@ def run_script(script, host=None, kind=None, timeout=20, python=None):
     exts = {"bash": "sh", "python3": "py", "powershell": "ps1", "cmd": "bat"}
     if kind not in exts:
         return VMResult(False, f"run_script: unknown kind '{kind}' (use one of {list(exts)})")
-    name = f"_script.{exts[kind]}"
-    remote.write_remote(f"{_wd()}/{name}", script, host=host)
+    # Per-call name (`_lh_script_<token>.<ext>`), removed after the call: a fixed
+    # `_script.<ext>` let two labhand processes on one host run each other's script
+    # (found 2026-11-20). The name is letters/digits/`._-` only, safe unquoted in bash,
+    # cmd.exe and PowerShell alike.
+    name = remote.scratch_name("script", exts[kind])
     # The python3 interpreter is PER HOST. Until 2026-09-23 this always used
     # remote.KALI_PYTHON (/home/vahpem/analysis-venv/bin/python3), bash-quoted, so
     # run_script(kind="python3", host="windows") asked cmd.exe to run a Linux path in
@@ -593,4 +608,8 @@ def run_script(script, host=None, kind=None, timeout=20, python=None):
         "cmd": name,
     }[kind]
     lines = script.count("\n") + 1
-    return _run_and_wrap(invoke, host, timeout, f"script({kind}, {lines} lines)")
+    try:
+        remote.write_remote(f"{_wd()}/{name}", script, host=host)
+        return _run_and_wrap(invoke, host, timeout, f"script({kind}, {lines} lines)")
+    finally:
+        remote.remove_quiet([name], host=host)

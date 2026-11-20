@@ -60,10 +60,18 @@ $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
 $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size)
-$bmp.Save("$S\_screen.png", [System.Drawing.Imaging.ImageFormat]::Png)
+$bmp.Save("$S\__SHOT__", [System.Drawing.Imaging.ImageFormat]::Png)
 $g.Dispose(); $bmp.Dispose()
-Write-Output ("SCREEN " + $b.Width + "x" + $b.Height + " -> _screen.png")
+Write-Output ("SCREEN " + $b.Width + "x" + $b.Height + " -> __SHOT__")
 """
+
+
+def _ps_screenshot(shot):
+    """The screenshot body saving to the per-call file `shot` (from remote.scratch_name:
+    letters, digits, `._-` only, so it is safe inside the double-quoted PowerShell
+    string). A fixed `_screen.png` let two labhand processes read each other's picture
+    (found 2026-11-20); the caller removes the file after the call."""
+    return _PS_SCREENSHOT.replace("__SHOT__", shot)
 
 
 def _session1(host, ps_body, **kw):
@@ -71,10 +79,10 @@ def _session1(host, ps_body, **kw):
     return remote.run_in_session1(ps_body, host=host, **kw)
 
 
-def _win_shot_image(label, host):
-    """Pull samples/_screen.png off the Windows VM and turn it into an image block."""
+def _win_shot_image(label, host, shot):
+    """Pull samples/<shot> off the Windows VM and turn it into an image block."""
     try:
-        raw = remote.read_bytes(f"{_wd()}/_screen.png", host=host)
+        raw = remote.read_bytes(f"{_wd()}/{shot}", host=host)
     except Exception as e:  # noqa: BLE001
         return None, f"(screenshot file could not be read back: {e})"
     media, b64, note = _prepare_image(raw, "png")
@@ -113,13 +121,17 @@ def win_screenshot(timeout=40, host=None):
     if _err:
         return _err
     host = _h.name
+    shot = remote.scratch_name("screen", "png")
     try:
-        text, timed_out = _session1(host, _PS_SCREENSHOT, timeout=int(timeout))
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"win_screenshot failed: {e.__class__.__name__}: {e}")
-    if timed_out or "SCREEN " not in text:
-        return VMResult(False, f"win_screenshot: capture did not report success - {text[:300]}")
-    img, note = _win_shot_image("the Windows desktop", host)
+        try:
+            text, timed_out = _session1(host, _ps_screenshot(shot), timeout=int(timeout))
+        except Exception as e:  # noqa: BLE001
+            return VMResult(False, f"win_screenshot failed: {e.__class__.__name__}: {e}")
+        if timed_out or "SCREEN " not in text:
+            return VMResult(False, f"win_screenshot: capture did not report success - {text[:300]}")
+        img, note = _win_shot_image("the Windows desktop", host, shot)
+    finally:
+        remote.remove_quiet([shot], host=host)
     if not img:
         return VMResult(False, f"win_screenshot: {note}")
     return VMResult(True, note + " - it appears on your NEXT turn", detail=text[:400],
@@ -255,6 +267,7 @@ def win_gui_run(program, args="", wait=6, kill=True, screenshot=True, timeout=60
     except Exception:  # noqa: BLE001 - never let the sync check itself break the tool
         gui_sync_note = ""
     argl = str(args or "").replace('"', "'")
+    shot = remote.scratch_name("screen", "png") if screenshot else None
     body = (
         'if (-not (Test-Path "' + prog + '")) { Write-Output "NOT_FOUND=' + prog + '"; return }\n'
         '$sp = @{ FilePath = "' + prog + '"; PassThru = $true; WorkingDirectory = $S }\n'
@@ -266,10 +279,19 @@ def win_gui_run(program, args="", wait=6, kill=True, screenshot=True, timeout=60
         'if ($p.HasExited) { Write-Output ("EXITCODE=" + $p.ExitCode) } '
         'else { Write-Output ("MAINWINDOW=" + $p.MainWindowTitle) }\n'
         + _PS_LIST_WINDOWS
-        + (_PS_SCREENSHOT if screenshot else "")
+        + (_ps_screenshot(shot) if screenshot else "")
         + ('\nif (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; '
            'Write-Output "KILLED" }\n' if kill else '\n')
     )
+    try:
+        return _win_gui_run_rest(host, body, program, prog, timeout, screenshot, shot,
+                                 gui_sync_note)
+    finally:
+        if shot:
+            remote.remove_quiet([shot], host=host)
+
+
+def _win_gui_run_rest(host, body, program, prog, timeout, screenshot, shot, gui_sync_note):
     try:
         text, timed_out = _session1(host, body, timeout=int(timeout))
     except Exception as e:  # noqa: BLE001
@@ -286,7 +308,7 @@ def win_gui_run(program, args="", wait=6, kill=True, screenshot=True, timeout=60
     img = None
     note = ""
     if screenshot and "SCREEN " in text:
-        img, note = _win_shot_image(f"the desktop after running {program}", host)
+        img, note = _win_shot_image(f"the desktop after running {program}", host, shot)
     summ = f"ran {program} on the Windows desktop" + ("; picture on your next turn" if img else "")
     detail, _ = _spill(host, text, "gui_run")
     return VMResult(True, summ, detail=detail,
@@ -310,7 +332,7 @@ def win_gui_run(program, args="", wait=6, kill=True, screenshot=True, timeout=60
 _FRIDA_DRIVER = r'''# -*- coding: utf-8 -*-
 import json, sys, time, os
 _HERE = os.path.dirname(os.path.abspath(__file__))
-CFG = json.load(open(os.path.join(_HERE, "_frida_cfg.json"), "r", encoding="utf-8"))
+CFG = json.load(open(os.path.join(_HERE, os.path.basename(sys.argv[1])), "r", encoding="utf-8"))
 MAXL = int(CFG.get("max_lines", 800))
 try:
     import frida
@@ -623,9 +645,29 @@ def win_frida(script, program=None, args="", pid=None, wait=8, kill=True,
     else:
         arglist = list(args or [])
 
+    # Every file of this call is per-call (`_lh_frida_js_<token>.js`, `..._cfg_...json`,
+    # `..._drv_...py`, `..._drive_...ps1`, `..._log_...txt`; the driver gets its config's
+    # name as argv[1], the config carries the others) and removed after the call: fixed
+    # names let two labhand processes hook with each other's script (found 2026-11-20).
+    tok = remote.scratch_token()
+    js_name, cfg_name = f"_lh_frida_js_{tok}.js", f"_lh_frida_cfg_{tok}.json"
+    drv_name, drive_name = f"_lh_frida_drv_{tok}.py", f"_lh_frida_drive_{tok}.ps1"
+    log_name = f"_lh_frida_log_{tok}.txt"
+    try:
+        return _win_frida_run(host, script, program, pid, prog, arglist, wait, kill,
+                              desktop, max_lines, timeout, drive_names, drive_window,
+                              drive_pause, drive_after, frida_sync_note,
+                              js_name, cfg_name, drv_name, drive_name, log_name)
+    finally:
+        remote.remove_quiet([js_name, cfg_name, drv_name, drive_name, log_name], host=host)
+
+
+def _win_frida_run(host, script, program, pid, prog, arglist, wait, kill, desktop,
+                   max_lines, timeout, drive_names, drive_window, drive_pause, drive_after,
+                   frida_sync_note, js_name, cfg_name, drv_name, drive_name, log_name):
     cfg = {"program": prog, "args": arglist, "wait": float(wait),
            "kill": bool(kill), "max_lines": int(max_lines),
-           "js_path": remote.win_samples(host) + "\\_frida.js"}
+           "js_path": remote.win_samples(host) + "\\" + js_name}
     if pid:
         cfg["pid"] = int(pid)
     drive_ps1_local = None
@@ -633,32 +675,31 @@ def win_frida(script, program=None, args="", pid=None, wait=8, kill=True,
         _dwin = str(drive_window or "").replace('"', "").replace("`", "")
         _drive_body = _ui_drive_ps(drive_names, _dwin, drive_pause, drive_after, 250)
         drive_ps1_local = _drive_body
-        cfg["drive_ps1"] = remote.win_samples(host) + "\\_frida_drive.ps1"
-    log_win = remote.win_samples(host) + "\\_frida_log.txt"
+        cfg["drive_ps1"] = remote.win_samples(host) + "\\" + drive_name
+    # the log name is unique to this call, so no stale log from an earlier call can be
+    # read as fresh data (the old fixed `_frida_log.txt` had to be deleted first)
+    log_win = remote.win_samples(host) + "\\" + log_name
     log_js = log_win.replace("\\", "/")
-    try:                      # a stale log from an earlier call would read as fresh data
-        remote.ssh_exec(f'del /q "{log_win}"', host=host, read_timeout=20)
-    except Exception:  # noqa: BLE001
-        pass
-    script = _FRIDA_PRELUDE_TMPL.replace("__LOGPATH__", log_js) + script
+    script_full = _FRIDA_PRELUDE_TMPL.replace("__LOGPATH__", log_js) + script
     try:
-        remote.write_remote(f"{_wd()}/_frida.js", script, host=host)
-        remote.write_remote(f"{_wd()}/_frida_cfg.json", json.dumps(cfg), host=host)
-        remote.write_remote(f"{_wd()}/_frida_drv.py", _FRIDA_DRIVER, host=host)
+        remote.write_remote(f"{_wd()}/{js_name}", script_full, host=host)
+        remote.write_remote(f"{_wd()}/{cfg_name}", json.dumps(cfg), host=host)
+        remote.write_remote(f"{_wd()}/{drv_name}", _FRIDA_DRIVER, host=host)
         if drive_ps1_local is not None:
-            remote.write_remote(f"{_wd()}/_frida_drive.ps1", drive_ps1_local, host=host)
+            remote.write_remote(f"{_wd()}/{drive_name}", drive_ps1_local, host=host)
     except Exception as e:  # noqa: BLE001
         return VMResult(False, f"win_frida: could not upload the script/driver: "
                                  f"{e.__class__.__name__}: {e}")
 
-    drv = remote.win_samples(host) + "\\_frida_drv.py"
+    drv = remote.win_samples(host) + "\\" + drv_name
     try:
         if desktop:
             text, timed_out = _session1(host, 
-                '& "' + remote.python_for(host) + '" "' + drv + '" 2>&1',
+                '& "' + remote.python_for(host) + '" "' + drv + '" "' + cfg_name + '" 2>&1',
                 timeout=int(timeout), task="labhand_frida")
         else:
-            o, e = remote.ssh_exec('"' + remote.python_for(host) + '" "' + drv + '"',
+            o, e = remote.ssh_exec('"' + remote.python_for(host) + '" "' + drv + '" "'
+                                   + cfg_name + '"',
                                    host=host, read_timeout=int(timeout) + 30)
             text = ((o or "") + (e or "")).strip()
             timed_out = "__FRIDA_END__" not in text
@@ -686,13 +727,14 @@ def win_frida(script, program=None, args="", pid=None, wait=8, kill=True,
     ferr = "FRIDA_ERROR" in text
     logged = ""
     try:
-        logged = remote.read_bytes(f"{_wd()}/_frida_log.txt",
+        logged = remote.read_bytes(f"{_wd()}/{log_name}",
                                    host=host).decode("utf-8", "replace")
     except Exception:  # noqa: BLE001 - no log file is the normal case
         logged = ""
     if logged.strip():
-        text += (f"\n=== log() file: {len(logged)} chars, {_wd()}/_frida_log.txt on "
-                 "windows (read_file it for the rest) ===\n" + logged)
+        # the per-call log file is removed after the call; the whole log is part of this
+        # result, so a long one lands in its spill file (paged with read_file)
+        text += (f"\n=== log() file: {len(logged)} chars ===\n" + logged)
     # The hook-lifetime trap, caught at the one moment it is provable.
     if not logged.strip() and nsend == 0 and "Interceptor.attach" in script \
             and not (jserr or ferr):

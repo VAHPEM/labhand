@@ -17,20 +17,26 @@ def linux_gui_run(command, wait=5, screen="1280x800x24", timeout=60, host=None):
     blocked = _security_block(command)
     if blocked:
         return VMResult(False, f"blocked: this command touches {blocked}")
+    # per-call screenshot file, removed after the call (a fixed `_xshot.png` let two
+    # labhand processes read each other's screenshot, found 2026-11-20)
+    shot = remote.scratch_name("xshot", "png")
     inner = (f"{command} & sleep {int(wait)}; "
              "(xdotool search --onlyvisible --name '.' getwindowname %@ 2>/dev/null "
              "| sed 's/^/XWIN /' | head -40); "
-             "import -window root _xshot.png 2>&1 && echo XSHOT_OK")
+             f"import -window root {shlex.quote(shot)} 2>&1 && echo XSHOT_OK")
     cmd = ("xvfb-run -a -s " + shlex.quote("-screen 0 " + str(screen)) + " bash -c "
            + shlex.quote(inner))
-    res = _run_and_wrap(cmd, host, timeout, f"xvfb({command[:40]})")
-    if "XSHOT_OK" not in (res.detail or ""):
-        return VMResult(False, "linux_gui_run: no screenshot was produced - "
-                                 f"output: {(res.detail or '')[:400]}")
     try:
-        raw = remote.read_bytes(f"{_wd()}/_xshot.png", host=host)
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"linux_gui_run: could not read _xshot.png back ({e})")
+        res = _run_and_wrap(cmd, host, timeout, f"xvfb({command[:40]})")
+        if "XSHOT_OK" not in (res.detail or ""):
+            return VMResult(False, "linux_gui_run: no screenshot was produced - "
+                                     f"output: {(res.detail or '')[:400]}")
+        try:
+            raw = remote.read_bytes(f"{_wd()}/{shot}", host=host)
+        except Exception as e:  # noqa: BLE001
+            return VMResult(False, f"linux_gui_run: could not read the screenshot back ({e})")
+    finally:
+        remote.remove_quiet([shot], host=host)
     media, b64, note = _prepare_image(raw, "png")
     if not media:
         return VMResult(False, f"linux_gui_run: screenshot unusable ({note})")
@@ -142,10 +148,11 @@ def run():    gdb.execute("run")      # start and run (breakpoints still fire)
 
 
 # Tail appended after the Brain's script is exec'd - so its OWN line numbers show up in a
-# traceback (as "brain_gdb_script"), not offset by the prelude length.
+# traceback (as "brain_gdb_script"), not offset by the prelude length. __GDB_USER__ is
+# replaced by the per-call name of the Brain's script file (repr-quoted).
 _GDB_RUN_TAIL = (
     "\ntry:\n"
-    "    with open('_gdb_user.py', 'r') as _f:\n"
+    "    with open(__GDB_USER__, 'r') as _f:\n"
     "        _src = _f.read()\n"
     "    exec(compile(_src, 'brain_gdb_script', 'exec'), globals())\n"
     "except Exception:\n"
@@ -177,14 +184,23 @@ def linux_gdb(prog, script, args="", gui=True, screen="1280x800x24",
 
     # Write the driver (prelude + exec-tail) and the Brain's script as SEPARATE files, so
     # a Python error in the Brain's code reports ITS line number, not a prelude-shifted one.
-    remote.write_remote(f"{_wd()}/_gdb_run.py", _GDB_PRELUDE + _GDB_RUN_TAIL, host=host)
-    remote.write_remote(f"{_wd()}/_gdb_user.py", script, host=host)
+    # Both are per-call (`_lh_gdbrun_<token>.py`, `_lh_gdbuser_<token>.py`) and removed
+    # after the call: fixed names let two labhand processes run each other's gdb script
+    # (found 2026-11-20).
+    run_name = remote.scratch_name("gdbrun", "py")
+    user_name = remote.scratch_name("gdbuser", "py")
 
     # gdb --args sets the inferior + argv but does NOT start it; the Brain's run()/starti()
     # does. timeout -k 10 tree-kills gdb (and the inferior in its process group) so a hung
     # target or an infinite continue cannot outlive the call and clog the VM.
-    gdb_cmd = (f"timeout -k 10 {timeout} gdb -q -batch -x _gdb_run.py "
-               f"--args ./{shlex.quote(prog)}" + (f" {argstr}" if argstr else ""))
+    # An absolute `prog` is passed as is; a relative one resolves in the workdir and gets
+    # "./" so gdb (and the shell) never search PATH for it. "./" was prefixed to every path
+    # before, so "/usr/bin/sleep" became ".//usr/bin/sleep": gdb said "No executable file
+    # specified" and the call still came back ok=True (found 2026-11-21).
+    prog_s = str(prog)
+    prog_arg = prog_s if prog_s.startswith("/") else "./" + prog_s
+    gdb_cmd = (f"timeout -k 10 {timeout} gdb -q -batch -x {shlex.quote(run_name)} "
+               f"--args {shlex.quote(prog_arg)}" + (f" {argstr}" if argstr else ""))
     if gui:
         inner = (f"cd {_wd()} 2>/dev/null; "
                  "xvfb-run -a -s " + shlex.quote("-screen 0 " + str(screen))
@@ -193,13 +209,29 @@ def linux_gdb(prog, script, args="", gui=True, screen="1280x800x24",
         inner = f"cd {_wd()} 2>/dev/null; " + gdb_cmd + "; echo __GDB_RC=$?"
     cmd = f"bash -c {shlex.quote(inner)}"
 
-    out, errtxt = remote.ssh_exec(cmd, host=host, read_timeout=timeout + 30)
-    combined = ((out or "") + (("\n" + errtxt) if (errtxt or "").strip() else "")).strip()
-
+    try:
+        remote.write_remote(f"{_wd()}/{run_name}",
+                            _GDB_PRELUDE + _GDB_RUN_TAIL.replace("__GDB_USER__", repr(user_name)),
+                            host=host)
+        remote.write_remote(f"{_wd()}/{user_name}", script, host=host)
+        out, errtxt = remote.ssh_exec(cmd, host=host, read_timeout=timeout + 30)
+    finally:
+        remote.remove_quiet([run_name, user_name], host=host)
+    # The `echo __GDB_RC=$?` marker is on STDOUT, as its last line: take the LAST marker
+    # line of stdout, before stderr is appended. Searching the end of stdout+stderr missed
+    # it whenever gdb wrote to stderr (pwndbg's terminfo warning on Kali), so a run killed
+    # by its timeout (rc 124) came back ok=True (measured 2026-11-20). Not anchored at the
+    # start of a line: a prompt without a newline (`Password: ` + a blocking read) puts the
+    # marker on the same line, `Password: __GDB_RC=124` (review R2-F1, 2026-11-21). Only the
+    # marker itself (and the line end the echo wrote) is stripped.
+    out = out or ""
     rc = None
-    mrc = re.search(r"__GDB_RC=(\d+)\s*$", combined)
-    if mrc:
-        rc = int(mrc.group(1)); combined = combined[:mrc.start()].rstrip()
+    mrcs = list(re.finditer(r"__GDB_RC=(\d+)[ \t\r]*\n?", out))
+    if mrcs:
+        mrc = mrcs[-1]
+        rc = int(mrc.group(1))
+        out = out[:mrc.start()] + out[mrc.end():]
+    combined = (out.strip() + (("\n" + errtxt) if (errtxt or "").strip() else "")).strip()
     timed_out = rc == 124
     if re.search(r"gdb:\s*(command )?not found|No such file.*gdb", combined) and rc:
         return VMResult(False, f"linux_gdb: gdb did not run on {host} - measured output: "
@@ -214,7 +246,7 @@ def linux_gdb(prog, script, args="", gui=True, screen="1280x800x24",
         combined = "\n".join(lines[:int(max_lines)])
     combined = (combined + capped) if combined else "(gdb produced no output)"
 
-    detail, saved = _spill(host, combined, "gdb_" + re.sub(r"[^A-Za-z0-9]", "_", prog)[:20])
+    detail, saved = _spill(host, combined, "gdb_" + re.sub(r"[^A-Za-z0-9]", "_", prog_s)[:20])
     flag = _find_match(combined)
     n = len(combined)
 

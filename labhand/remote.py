@@ -87,10 +87,10 @@ def _client(host, user, attempts=3):
     raise last
 
 
-def get_client(host):
+def get_client(host, attempts=3):
     """A fresh SSH client to inventory host `host` (raises hosts.HostError if unknown)."""
     h = hosts.get(host)
-    return _client(h.address, h.user)
+    return _client(h.address, h.user, attempts=attempts)
 
 
 def get_kali():          # pre-inventory helper: the first linux host
@@ -129,7 +129,7 @@ def _drop(host):
             pass
 
 
-def _get(host):
+def _get(host, attempts=3):
     host = _key(host)
     c = _POOL.get(host)
     if c is not None:
@@ -137,7 +137,7 @@ def _get(host):
         if t is not None and t.is_active():
             return c
         _drop(host)
-    c = get_client(host)
+    c = get_client(host, attempts=attempts)
     try:
         c.get_transport().set_keepalive(30)   # survives a long Brain call in between
     except Exception:  # noqa: BLE001
@@ -156,18 +156,21 @@ _atexit.register(_close_pool)
 _CONN_ERRORS = (paramiko.SSHException, EOFError, ConnectionError, OSError)
 
 
-def _sftp_op(host, fn):
+def _sftp_op(host, fn, quick=False):
     """Run fn(sftp) on the pooled connection. SFTP operations here are idempotent
     (overwrite a file, read a file, create a dir), so one retry on a fresh connection
     is safe. An IOError from the remote side (no such file) is NOT a connection
-    problem and is passed straight through."""
-    for attempt in (1, 2):
-        c = _get(host)
+    problem and is passed straight through. `quick` (cleanup): one try, one connect
+    attempt, so an unreachable host does not add the full retry delay to a call that
+    already failed."""
+    tries = (1,) if quick else (1, 2)
+    for attempt in tries:
+        c = _get(host, attempts=1) if quick else _get(host)
         try:
             sftp = c.open_sftp()
         except _CONN_ERRORS:
             _drop(host)
-            if attempt == 2:
+            if attempt == tries[-1]:
                 raise
             continue
         try:
@@ -324,6 +327,42 @@ def read_bytes(remote_path, host=None):
     return _sftp_op(host, _op)
 
 
+def scratch_name(stem, ext=""):
+    """A per-call scratch file name (labhand.output.scratch_name: `_lh_<stem>_<time_ns>_<pid>
+    _<rand8>[.ext]`), unique across calls, threads and processes."""
+    from .output import scratch_name as _sn      # output imports remote: import lazily
+    return _sn(stem, ext)
+
+
+def scratch_token():
+    """The per-call token alone (`<time_ns>_<pid>_<rand8>`), for a set of names (or a
+    scheduled task name) that belong to one call."""
+    from .output import _unique_token
+    return _unique_token()
+
+
+def remove_quiet(names, host=None):
+    """Best-effort removal of per-call scratch files `names` (paths relative to the
+    workdir) on `host` over SFTP; never raises. Called from a `finally`, so the files go
+    on success, error and timeout alike. A dead pooled connection is replaced by ONE
+    fresh connect attempt (a blip that killed the call's own channel is covered; an
+    unreachable host costs one connect timeout, not the full retry ladder)."""
+    names = [n for n in names if n]
+    if not names:
+        return
+
+    def _op(sftp):
+        for n in names:
+            try:
+                sftp.remove(f"{_wd()}/{n}")
+            except IOError:          # already gone / never written / locked on Windows
+                pass
+    try:
+        _sftp_op(host, _op, quick=True)
+    except Exception:  # noqa: BLE001 - cleanup must never turn a result into an exception
+        pass
+
+
 class DownloadError(Exception):
     """download_to() refused or failed; the message is meant for the caller. `dirty`: the
     transfer was cut off with SFTP replies still in flight, so the connection is dropped."""
@@ -422,12 +461,15 @@ def download_to(remote_path, local_fh, host=None, max_bytes=None, timeout=600,
 # it is produced (PYTHONUNBUFFERED) so everything printed before the kill survives.
 # The command is read from a FILE and run through cmd.exe /c, so it has exactly the
 # quoting semantics it had when it was passed on the SSH command line - no second
-# layer of escaping to get wrong.
+# layer of escaping to get wrong. The command file and the launcher are per-call
+# (`_lh_wincmd_<token>.txt`, `_lh_winrun_<token>.py`; the launcher gets the command
+# file's name as argv[2]) and removed after the call: with fixed names two labhand
+# processes on one host raced and one ran the other's command (found 2026-11-20).
 _WIN_LAUNCHER = r"""# -*- coding: utf-8 -*-
 import os, sys, subprocess
 here = os.path.dirname(os.path.abspath(__file__))
 limit = float(sys.argv[1])
-cmdline = open(os.path.join(here, "_win_cmd.txt"), encoding="utf-8").read().strip()
+cmdline = open(os.path.join(here, os.path.basename(sys.argv[2])), encoding="utf-8").read().strip()
 env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
 sys.stdout.flush()
 p = subprocess.Popen(cmdline, shell=True, cwd=here, env=env, stderr=subprocess.STDOUT)
@@ -452,33 +494,43 @@ def win_run_bounded(command, timeout, host=None):
     with a REAL, tree-killing timeout. Returns (stdout, stderr); stdout ends with
     __RC=<n> (124 = timed out)."""
     host = hosts.get(host, "windows").name
-    write_remote(f"{_wd()}/_win_cmd.txt", command, host=host)
-    write_remote(f"{_wd()}/_timeout_run.py", _WIN_LAUNCHER, host=host)
-    launcher = win_samples(host) + "\\_timeout_run.py"
-    return ssh_exec(f'"{python_for(host)}" "{launcher}" {int(timeout)}',
-                    host=host, read_timeout=int(timeout) + 25)
+    cmd_name = scratch_name("wincmd", "txt")
+    run_name = scratch_name("winrun", "py")
+    try:
+        write_remote(f"{_wd()}/{cmd_name}", command, host=host)
+        write_remote(f"{_wd()}/{run_name}", _WIN_LAUNCHER, host=host)
+        launcher = win_samples(host) + "\\" + run_name
+        return ssh_exec(f'"{python_for(host)}" "{launcher}" {int(timeout)} "{cmd_name}"',
+                        host=host, read_timeout=int(timeout) + 25)
+    finally:
+        remove_quiet([cmd_name, run_name], host=host)
 
 
 def run_script(script, host=None, timeout=20, python=None):
-    """Write exploit.py to samples/ and run it under the right interpreter,
+    """Write the script to a per-call `samples/_lh_exploit_<token>.py` (removed after the
+    call) and run it under the right interpreter,
     bounded by a REAL timeout on both hosts. `python` overrides the interpreter
     (absolute path) - needed when a challenge's payload is version-locked to an
     interpreter other than the host's <NAME>_PYTHON (e.g. a CPython the Brain installed with
     `uv python install 3.12`). Returns combined output."""
-    write_remote(f"{_wd()}/exploit.py", script, host=host)
-    if is_windows(host):
-        exe = python or python_for(host)
-        # real timeout + real exit code (was: read_timeout only, rc squashed to 0/1)
-        o, e = win_run_bounded(f'"{exe}" exploit.py', timeout, host=host)
-    else:
-        exe = python or python_for(host)
-        # `timeout -k 5` runs the child in its OWN process group and signals the
-        # whole group, so a solver that forks does not leave orphans behind
-        # (measured 2026-09-22: without it, a killed SSH channel left the remote
-        # command running to completion on the VM).
-        cmd = (f"cd {_wd()} && timeout -k 5 {int(timeout)} {shlex.quote(exe)} "
-               f"exploit.py 2>&1; echo __RC=$?")
-        o, e = ssh_exec(cmd, host=host, read_timeout=timeout + 25)
+    name = scratch_name("exploit", "py")
+    try:
+        write_remote(f"{_wd()}/{name}", script, host=host)
+        if is_windows(host):
+            exe = python or python_for(host)
+            # real timeout + real exit code (was: read_timeout only, rc squashed to 0/1)
+            o, e = win_run_bounded(f'"{exe}" "{name}"', timeout, host=host)
+        else:
+            exe = python or python_for(host)
+            # `timeout -k 5` runs the child in its OWN process group and signals the
+            # whole group, so a solver that forks does not leave orphans behind
+            # (measured 2026-09-22: without it, a killed SSH channel left the remote
+            # command running to completion on the VM).
+            cmd = (f"cd {_wd()} && timeout -k 5 {int(timeout)} {shlex.quote(exe)} "
+                   f"{shlex.quote(name)} 2>&1; echo __RC=$?")
+            o, e = ssh_exec(cmd, host=host, read_timeout=timeout + 25)
+    finally:
+        remove_quiet([name], host=host)
     return (o + "\n" + e).strip()
 
 
@@ -513,18 +565,26 @@ def win_samples(host=None):
     return win_home(host) + "\\" + _wdw()
 
 
+# Every file of one session-1 call is per-call (`_lh_guitask_<token>.ps1`,
+# `_lh_guidrv_<token>.ps1`, `_lh_guiout_<token>.txt`, `_lh_guidone_<token>.txt`) and so is
+# the scheduled task (`<task>_<token>`): with fixed names two labhand processes driving one
+# desktop overwrote each other's task body and read each other's output (found 2026-11-20).
+# The names are letters, digits and `._-` only; they are formatted into the PowerShell as
+# double-quoted literals (no `$`, backtick or quote can occur in them).
 _GUI_DRIVER = """
 $S = "{samples}"
 $T = "{task}"
-Remove-Item -Force -ErrorAction SilentlyContinue "$S\\_gui_out.txt","$S\\_gui_done.txt"
-schtasks /create /tn $T /tr "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $S\\_gui_task.ps1" /sc once /st 00:00 /f /it /rl highest 2>&1 | Out-Null
+$OUT = "$S\\{out}"
+$DONE = "$S\\{done}"
+Remove-Item -Force -ErrorAction SilentlyContinue $OUT,$DONE
+schtasks /create /tn $T /tr "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $S\\{taskfile}" /sc once /st 00:00 /f /it /rl highest 2>&1 | Out-Null
 schtasks /run /tn $T 2>&1 | Out-Null
 $deadline = (Get-Date).AddSeconds({timeout})
-while ((Get-Date) -lt $deadline -and -not (Test-Path "$S\\_gui_done.txt")) {{ Start-Sleep -Milliseconds 400 }}
-$done = Test-Path "$S\\_gui_done.txt"
+while ((Get-Date) -lt $deadline -and -not (Test-Path $DONE)) {{ Start-Sleep -Milliseconds 400 }}
+$done = Test-Path $DONE
 schtasks /end /tn $T 2>&1 | Out-Null
 schtasks /delete /tn $T /f 2>&1 | Out-Null
-if (Test-Path "$S\\_gui_out.txt") {{ Get-Content -Raw "$S\\_gui_out.txt" }}
+if (Test-Path $OUT) {{ Get-Content -Raw $OUT }}
 if (-not $done) {{ Write-Output "__GUI_TIMEOUT__" }}
 Write-Output "__GUI_END__"
 """
@@ -535,8 +595,8 @@ $S = "{samples}"
 $out = & {{
 {body}
 }} 2>&1
-$out | Out-File -FilePath "$S\\_gui_out.txt" -Encoding utf8
-"done" | Out-File -FilePath "$S\\_gui_done.txt" -Encoding ascii
+$out | Out-File -FilePath "$S\\{out}" -Encoding utf8
+"done" | Out-File -FilePath "$S\\{done}" -Encoding ascii
 """
 
 
@@ -544,21 +604,43 @@ def run_in_session1(ps_body, timeout=60, task="labhand_gui", host=None):
     """Run a PowerShell body on the Windows INTERACTIVE desktop; return (text, timed_out).
 
     The body may use $S for the samples dir; whatever it Write-Output's comes back.
-    `host`: a windows host of the inventory (default: the first one).
+    `host`: a windows host of the inventory (default: the first one). `task` is the
+    scheduled task's name prefix; the real name gets the per-call token appended.
+    Every per-call file is removed afterwards and the task is deleted, on every path.
     """
     host = hosts.get(host, "windows").name
     samples = win_samples(host)
-    ssh_exec('if not exist "' + samples + '" mkdir "' + samples + '"',
-             host=host, read_timeout=25)
-    write_remote(f"{_wd()}/_gui_task.ps1",
-                 _GUI_TASK_WRAPPER.format(samples=samples, body=ps_body), host=host)
-    write_remote(f"{_wd()}/_gui_driver.ps1",
-                 _GUI_DRIVER.format(samples=samples, task=task, timeout=int(timeout)),
-                 host=host)
-    o, e = ssh_exec(
-        'powershell -NoProfile -ExecutionPolicy Bypass -File "' + samples + '\\_gui_driver.ps1"',
-        host=host, read_timeout=int(timeout) + 45)
-    text = ((o or "") + (e or "")).strip()
+    tok = scratch_token()                          # time_ns_pid_rand of this call
+    taskfile, drvfile = f"_lh_guitask_{tok}.ps1", f"_lh_guidrv_{tok}.ps1"
+    outfile, donefile = f"_lh_guiout_{tok}.txt", f"_lh_guidone_{tok}.txt"
+    task = re.sub(r"[^A-Za-z0-9_-]", "_", str(task or "labhand_gui")) + "_" + tok
+    ended = False
+    try:
+        ssh_exec('if not exist "' + samples + '" mkdir "' + samples + '"',
+                 host=host, read_timeout=25)
+        write_remote(f"{_wd()}/{taskfile}",
+                     _GUI_TASK_WRAPPER.format(samples=samples, body=ps_body,
+                                              out=outfile, done=donefile), host=host)
+        write_remote(f"{_wd()}/{drvfile}",
+                     _GUI_DRIVER.format(samples=samples, task=task, timeout=int(timeout),
+                                        out=outfile, done=donefile, taskfile=taskfile),
+                     host=host)
+        o, e = ssh_exec(
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "' + samples + '\\' + drvfile + '"',
+            host=host, read_timeout=int(timeout) + 45)
+        text = ((o or "") + (e or "")).strip()
+        ended = "__GUI_END__" in text
+    finally:
+        if not ended:
+            # the driver did not reach its own `schtasks /delete` (connection lost, the
+            # SSH read timed out, an upload failed): end and delete the task from here
+            try:
+                ssh_exec(f'schtasks /end /tn "{task}" >nul 2>&1 & '
+                         f'schtasks /delete /tn "{task}" /f >nul 2>&1',
+                         host=host, read_timeout=25)
+            except Exception:  # noqa: BLE001 - best effort; the result stands
+                pass
+        remove_quiet([taskfile, drvfile, outfile, donefile], host=host)
     timed_out = "__GUI_TIMEOUT__" in text
     text = text.replace("__GUI_TIMEOUT__", "").replace("__GUI_END__", "").strip()
     return text, timed_out

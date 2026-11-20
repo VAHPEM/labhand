@@ -50,16 +50,24 @@ def _prepare_image(raw, ext):
         return None, None, f"could not decode as an image ({e.__class__.__name__}: {e})"
     # no Pillow on the host: ImageMagick on Kali can still convert
     if ext in _CONVERTIBLE:
+        # per-call in/out names, removed after the call (fixed `_viewconv_in` /
+        # `_viewconv_out.png` let two labhand processes swap pictures, found 2026-11-20)
+        lin = src = dst = None
         try:
             lin = hosts.default("linux")        # ImageMagick lives on a linux host
-            remote.write_remote(f"{_wd()}/_viewconv_in", raw, host=lin)
-            remote.ssh_exec(f"cd {_wd()} && convert _viewconv_in -resize "
-                            f"{IMAGE_MAX_EDGE}x{IMAGE_MAX_EDGE}\\> _viewconv_out.png",
+            src = remote.scratch_name("viewconv_in")
+            dst = remote.scratch_name("viewconv_out", "png")
+            remote.write_remote(f"{_wd()}/{src}", raw, host=lin)
+            remote.ssh_exec(f"cd {_wd()} && convert {src} -resize "
+                            f"{IMAGE_MAX_EDGE}x{IMAGE_MAX_EDGE}\\> {dst}",
                             host=lin, read_timeout=40)
-            png = remote.read_bytes(f"{_wd()}/_viewconv_out.png", host=lin)
+            png = remote.read_bytes(f"{_wd()}/{dst}", host=lin)
             return "image/png", base64.b64encode(png).decode(), f" (converted on {lin})"
         except Exception as e:  # noqa: BLE001
             return None, None, f"format .{ext} needs conversion and it failed ({e})"
+        finally:
+            if lin:
+                remote.remove_quiet([src, dst], host=lin)
     if ext in _VIEWABLE:
         if len(raw) > IMAGE_MAX_BYTES:
             return None, None, f"{len(raw)} bytes is over the {IMAGE_MAX_BYTES}-byte cap"
