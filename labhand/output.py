@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 """labhand.output — paging limits and spilling large output to a file on the host."""
+import os
+import re
+import secrets
+import threading
+import time
+
 from . import remote, config
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
 from ._result import VMResult, SLICE  # noqa
@@ -23,7 +29,38 @@ def _clamp_page(length):
 SLICE = 4000
 
 
-_SPILL_N = [0]
+# Spill names must be unique per CALL, not per process. Until 2026-11-20 a counter
+# (`_SPILL_N`) restarted at _001 in every Python process, so two labhand processes
+# (two MCP servers, two library scripts, or one run after another) both wrote
+# `_ghidra_001.txt` and one silently overwrote the other's output (measured live).
+# The name now carries the wall clock in ns (kept strictly increasing within this
+# process under the lock, so two calls in one ns still differ), the pid (another
+# process) and 32 random bits (pid reuse, clock steps, a frozen clock).
+_SPILL_LOCK = threading.Lock()
+_SPILL_LAST_NS = [0]
+_STEM_BAD = re.compile(r"[^A-Za-z0-9._-]")
+_STEM_MAX = 48                 # job_ + a 40-char job name stays whole
+
+
+def _after_fork_in_child():
+    # a fork taken while another thread held the lock would leave it held forever
+    global _SPILL_LOCK
+    _SPILL_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
+def _spill_name(stem):
+    """`_{stem}_{time_ns}_{pid}_{rand8}.txt`: one path component made only of
+    LABHAND_WORKDIR's characters (letters, digits, `._-`), at most ~90 chars."""
+    stem = _STEM_BAD.sub("_", str(stem or ""))[:_STEM_MAX].strip(".") or "out"
+    stem = stem.replace("..", "_")
+    with _SPILL_LOCK:
+        ns = max(time.time_ns(), _SPILL_LAST_NS[0] + 1)
+        _SPILL_LAST_NS[0] = ns
+    return f"_{stem}_{ns}_{os.getpid()}_{secrets.token_hex(4)}.txt"
 
 
 def _spill(host, text, stem="out"):
@@ -38,7 +75,9 @@ def _spill(host, text, stem="out"):
       * win_windows / win_gui_run / pdf_pages just did text[:SLICE] - everything past
         4000 characters was gone with no way to ask for it.
 
-    Returns (inline_text, saved_path_or_None); the name is unique to THIS call.
+    Returns (inline_text, saved_path_or_None); the name is unique to THIS call, also
+    across processes and threads: `_{stem}_{time_ns}_{pid}_{rand8}.txt` (see
+    `_spill_name`), e.g. `samples/_cmd_out_1763650000123456789_4242_9f3a1c0e.txt`.
     """
     # SLICE (4000) is the default PAGE size for peek/read_file; it is NOT the size of
     # what one turn can SHOW. That is config.OBS_CAP_NEWEST (12000). head + marker +
@@ -49,8 +88,7 @@ def _spill(host, text, stem="out"):
     from . import config as _cfg
     budget = max(int(getattr(_cfg, "OBS_CAP_NEWEST", 12000)) - 1900, SLICE)
     tail_n = 1200
-    _SPILL_N[0] += 1
-    name = f"_{stem}_{_SPILL_N[0]:03d}.txt"
+    name = _spill_name(stem)
     # ALWAYS persist output larger than one PAGE, so it can be paged back on a LATER
     # turn once the observation window has trimmed it. Regression measured 2026-09-23:
     # a version that "saved nothing when it fits the window" showed a 6000-char result
