@@ -31,9 +31,15 @@ caller's.
 - **Go dynamic** (the moment two static looks stop answering - the two-dead-ends
   rule): Linux ELF -> `linux.linux_gdb` (scripted gdb, ASLR off, fixed PIE base);
   Windows -> `windows.win_frida` (inspect/replace a value, or drive the UI);
-  a headless Kali GUI -> `linux.linux_gui_run`.
+  a headless Kali GUI -> `linux_ui.linux_ui_start` (below), not `linux.linux_gui_run`.
 - **See / read a GUI:** `windows.win_windows` (text, cheap) first, then
   `windows.win_screenshot`; render a PDF/image and look at the returned picture.
+  A Linux GUI app (GTK, Qt, Firefox, Chromium, Java Swing): prefer the `linux_ui_*`
+  text tools over `linux_gui_run` pictures: `linux_ui_start(cmd)` -> `linux_ui_tree`
+  (one line per element, `#id`s) -> `linux_ui_click` / `linux_ui_type` (each re-reads,
+  because an action reports success even when nothing changed) -> `linux_ui_stop`.
+  Take `linux_ui_screenshot` only for layout. Custom-painted content (terminals,
+  canvases) is not in the tree. For Ghidra use `linux_ghidra` (headless), not its GUI.
 - **Write a solver that is efficient, not brute:** `shell.run_script` (print every
   value); a heavy search runs as a background job via `jobs.job_start` /
   `jobs.job_poll`.
