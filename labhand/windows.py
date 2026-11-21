@@ -54,8 +54,18 @@ try {
 """
 
 
+# SetProcessDPIAware FIRST: a DPI-unaware PowerShell gets VirtualScreen in logical pixels,
+# and CopyFromScreen copies only that corner of the physical screen. MEASURED 2026-11-21
+# (Windows 11 ARM64 at 200 % scaling, 2640x1650): win_screenshot returned 1320x825 = the
+# top-left quarter of the desktop, while win_gui_run (whose body loads UI Automation,
+# which made the process DPI-aware, before this snippet) returned the full 2640x1650.
+# Guarded so a body that includes the snippet twice does not redefine the type.
 _PS_SCREENSHOT = r"""
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+if (-not ("LhDpi.User32" -as [type])) {
+  Add-Type -Namespace LhDpi -Name User32 -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+}
+[void][LhDpi.User32]::SetProcessDPIAware()
 $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
 $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)
 $g = [System.Drawing.Graphics]::FromImage($bmp)
