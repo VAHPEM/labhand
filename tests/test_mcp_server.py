@@ -26,9 +26,11 @@ EXPECTED_TOOLS = {
     "linux_gui_run", "linux_gdb", "linux_ghidra", "linux_capa", "linux_yara", "linux_vol", "upload_file",
     "download_file",
     "vm_status", "vm_start", "vm_stop", "vm_revert", "vm_snapshot",
+    "linux_ui_start", "linux_ui_tree", "linux_ui_click", "linux_ui_type",
+    "linux_ui_screenshot", "linux_ui_stop",
 }
 READ_ONLY = {"read_file", "win_windows", "win_screenshot", "win_ui_tree", "vm_status",
-             "linux_capa", "linux_yara", "linux_vol"}
+             "linux_capa", "linux_yara", "linux_vol", "linux_ui_tree", "linux_ui_screenshot"}
 HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
 
 # 1x1 transparent PNG

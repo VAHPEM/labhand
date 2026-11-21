@@ -109,11 +109,46 @@ connection. Every `win_*` / `linux_*` call below also takes `host=None`.
 ### Linux — headless GUI & debugger — `labhand.linux`
 | call | does |
 |---|---|
-| `linux_gui_run(command, wait=5, screen="1280x800x24", timeout=60)` | run a GUI program on Kali under **Xvfb** and return a screenshot. |
+| `linux_gui_run(command, wait=5, screen="1280x800x24", timeout=60)` | run a GUI program on Kali under **Xvfb** and return a screenshot. Its `xvfb-run -a` (and `linux_gdb`'s) takes the workdir display lock shared with `linux_ui_start`. |
 | `linux_gdb(prog, script, args="", gui=True, screen="1280x800x24", max_lines=800, timeout=120)` | run a **gdb-python** script against an ELF (`prog`: relative = in `samples/`, or an absolute path; ASLR off, PIE base fixed at `0x555555554000`); returns whatever it `log()`s. Helpers injected: `rd/wr/u64/u32/f64/reg/cstr/at/hook/starti/cont/run`. |
 | `linux_ghidra(path, script="", script_name="labhand_ghidra.py", script_args=(), analyze=True, host=None, timeout=300, extra="")` | run **Ghidra headless** (`analyzeHeadless`) on a linux host: import `path` (host workdir) into a fresh per-call project (`-deleteProject`, `-readOnly`: nothing saved, sample untouched), analyse unless `analyze=False` (`-noanalysis`), run `script` as post-script `script_name` (the extension picks the language: `.py` runs under **PyGhidra** via `python3 -P -m pyghidra.ghidra_launch` after an import check (`-P`: nothing is imported from the samples cwd; Python >= 3.11) - not importable → raw `ok=False`, never installed; anything else, e.g. `.java`, under analyzeHeadless itself. Ghidra 12 has no Jython, measured 2026-11-20) with `script_args`; **raw** Ghidra log + script output, `known` = analyzeHeadless path, Ghidra version, PyGhidra version + python (`.py`), exit code, elapsed. Per-call dirs `samples/_lh_ghidra_<uuid>/` and the OSGi bundle Ghidra compiles for that call's script dir (`~/.config/ghidra/*/osgi/compiled-bundles/<hash>`) removed on every path; tree-killing timeout. Located by `<NAME>_GHIDRA_HEADLESS` (inventory, absolute path), else `command -v analyzeHeadless`, else `/usr/share/ghidra/support/analyzeHeadless`, `/opt/ghidra/support/analyzeHeadless`. Not found → raw `ok=False`; labhand never installs. Prefer it over driving Ghidra's GUI by `linux_gui_run` screenshots. |
 | `linux_capa(path, host=None, timeout=120, extra="")` | run **capa** on a linux host against `path` (in the host workdir); returns capa's **raw** output. labhand only runs it — the analyst/Brain reads the MITRE ATT&CK / MBC mapping. Not installed → raw `ok=False`; labhand never installs. |
 | `linux_yara(rules, target, host=None, timeout=60, extra="")` | run **yara** (`rules` against `target`) on a linux host; **raw** output, no interpretation. Not installed → raw `ok=False`. |
+
+### Linux GUI as text (AT-SPI) — `labhand.linux_ui`
+Read and drive a GUI app on a linux host as **text** through its accessibility tree (AT-SPI),
+step by step, instead of `linux_gui_run` pictures. A **session** = one app under its own
+Xvfb display + a **private** D-Bus session bus (never the real `:0` or the desktop's bus:
+without a private bus AT-SPI reaches the logged-in desktop's apps, measured), kept alive
+between calls. Measured basis: `~/.ccbridge/reviews/kali-atspi/REPORT.md`; live run:
+`~/.ccbridge/reviews/labhand-linux-ui/LIVE.md`.
+| call | does |
+|---|---|
+| `linux_ui_start(command, name=None, screen="1280x800x24", wait=5, host=None, timeout=60, max_minutes=30)` | start `command` (runs verbatim from a file, cwd = workdir) as a labhand-owned background session: `setsid` supervisor → `timeout -k 10 <max>` → `xvfb-run -a` → `dbus-run-session --config-file` (allow-list: only `org.a11y.Bus` and `ca.desrt.dconf` can be activated, so no gvfs / portals / FUSE mounts). Throw-away `HOME`, `XDG_{CONFIG,CACHE,DATA,STATE}_HOME`, `XDG_RUNTIME_DIR`, `TMPDIR` in `samples/_lh_ui_<session>/`. Returns the session name (`<stem>-<8 hex>`); `known` = display, pids, state dir. The session dies by itself after `max_minutes` (dir removed too). |
+| `linux_ui_tree(session, match=None, limit=250, depth=30, showing_only=True, host=None, timeout=45)` | the tree as text, one line per element: `#id [role] 'name' (key states) actions=a\|b text='...'`. Only `showing` subtrees by default (a full Ghidra CodeBrowser tree was 1.78 M chars, 20-31 k showing), closed menus not walked (marked `[closed menu: N items]`), ≤4 actions per line, `match` keeps subtrees whose name/role contains it (+ ancestors), `limit` caps lines and says how many were cut. The `#id`s stay valid until the next tree of that session; each stores role, name, description, the parent's child count and (when showing) the screen extents, and an act tool refuses the id when any of them changed (a removed row would otherwise let the next row's identical `Delete` slide into its place). `ids.json` is written under a per-session lock, so a tree and a name-resolve at the same time lose nothing. |
+| `linux_ui_click(session, target, action=None, host=None, timeout=45)` | `target` = `#id` from the last tree (refused if that element changed meanwhile), or a name / `role:name` (`menu item:About`; exact name, then description, then prefix; showing wins; ambiguous → the candidates with new ids). Runs the AT-SPI action (default the first of click/press/activate/toggle), then **re-reads** the element and lists the app's windows: `do_action` returns True even when nothing happens. Items of a closed menu can be clicked directly. |
+| `linux_ui_type(session, text, target=None, enter=False, host=None, timeout=45)` | replace `target`'s text: `EditableText.set_text_contents` when it has it; when it lacks it (Chromium) or ignores it (Firefox: True, value unchanged) → `grab_focus` + pointer to the element + `xdotool` ctrl+a + type (text on stdin). Then the text is **read back**; ok = read-back equals `text`. No `target`: xdotool types at the keyboard focus. |
+| `linux_ui_screenshot(session, host=None, timeout=30)` | a picture of the session's display (`r.image`), for layout questions text cannot answer. |
+| `linux_ui_stop(session=None, host=None, timeout=30)` | end a session: every process carrying its env marker `LABHAND_UI_SESSION=<session>` (app, Xvfb, bus, a11y bus, children) + the supervisor get TERM, then KILL; a stale X lock of its display and its dir go (FUSE mounts unmounted first, `rm --one-file-system`). No `session`: list the live sessions (and orphan processes). |
+Switches set in every session (all per process; an app without its switch is simply absent
+from the tree): GTK3/GTK4 none; Qt5/Qt6 `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`; Firefox
+`GNOME_ACCESSIBILITY=1`; Java Swing `JAVA_TOOL_OPTIONS=-Xbootclasspath/a:/usr/share/java/java-atk-wrapper.jar
+-Djavax.accessibility.assistive_technologies=org.GNOME.Accessibility.AtkWrapper -XX:-UsePerfData`
+(no hsperfdata file in /tmp); **Chromium also needs `--force-renderer-accessibility` on its
+own command line** (pass it in `command`). Also `GIO_USE_VFS=local`, `GTK_USE_PORTAL=0`.
+Blind spots: custom-painted content is not in the tree (qterminal's terminal screen, canvases);
+web text fields need the xdotool fallback; icon-only buttons have no name (a `desc=` is shown);
+names carry padding / accelerators (`'New      '`, `'New Project... Ctrl+N'`: match by prefix);
+Ghidra's CodeBrowser breaks java-atk-wrapper in most launches: use `linux_ghidra`. Always
+verify an action by reading again. Needs xvfb-run, dbus-run-session, python3-gi + the Atspi
+typelib, at-spi2-core (xdotool for the type fallback / Enter, ImageMagick `import` for the
+screenshot); missing → raw `ok=False` naming it, labhand never installs. A start serialises
+on a flock of the workdir directory until its display is up; `linux_gui_run` and `linux_gdb(gui=True)`
+take the same lock around their `xvfb-run -a` (released inside it once Xvfb is up), so no two
+labhand starts pick the same display (a non-labhand `xvfb-run -a` at the same instant can still
+collide: the start then fails cleanly). Output labhand did not write (the app's log, the session log, element text, D-Bus error text, the driver's stderr) is neutralised on the host, so no line of it can start with labhand's `__LH_` status markers; a start that fails after its session dir exists always tears the session down and names it. **A session is a private environment, not a sandbox:** labhand never points it at the real `:0`, the real session bus or the real home, but the app runs as the same uid, so a program that targets them by explicit path (`DISPLAY=:0`, `/run/user/<uid>/bus`, `/home/<user>`) still reaches them, and it can touch labhand's own session files; isolate untrusted samples with a disposable VM (`vm_revert`) and the lab network boundary. Known limit: a process that clears `LABHAND_UI_SESSION`
+from its environment **and** calls `setsid` escapes `linux_ui_stop` and the `max_minutes` expiry
+(the same class as every labhand tree kill).
 
 ### UTM power & disposable sessions — `labhand.utm` (runs `utmctl` on the Mac, not over SSH)
 Needs `<NAME>_UTM_VM` in the inventory. Refuses to stop a host with a RUNNING job.
@@ -177,7 +212,7 @@ LABHAND_ENV=... LABHAND_SSH_KEY=... labhand-mcp      # stdio; = python -m labhan
 ```
 Each tool above is published as an MCP tool; screenshots come back as image content.
 Every tool declares all four MCP hints (readOnly / destructive / idempotent /
-openWorld): `read_file`, `win_windows`, `win_screenshot`, `win_ui_tree`, `vm_status`, `linux_capa`, `linux_yara` are read-only;
+openWorld): `read_file`, `win_windows`, `win_screenshot`, `win_ui_tree`, `vm_status`, `linux_capa`, `linux_yara`, `linux_vol`, `linux_ui_tree`, `linux_ui_screenshot` are read-only;
 everything else is destructive. Keep this when adding a tool (`tests/` enforces it).
 The server registers as `labhand`. See `labhand/mcp_server.py`.
 
@@ -213,7 +248,7 @@ The server registers as `labhand`. See `labhand/mcp_server.py`.
 ## Map of the package
 
 `labhand/`: `hosts.py` (the host inventory), `remote.py` (SSH/SFTP pool), `shell.py` (run/read), `windows.py`,
-`linux.py`, `jobs.py`, `images.py`, `safety.py`, `_result.py` (`VMResult`,
+`linux.py`, `linux_ui.py` (GUI as text through AT-SPI), `jobs.py`, `images.py`, `safety.py`, `_result.py` (`VMResult`,
 `set_matcher`), `config.py`, `mcp_server.py`.
 
 `skills/`: the agent skills, one `skills/<name>/SKILL.md` each — the **single source**,

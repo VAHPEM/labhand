@@ -9,6 +9,25 @@ from .images import _prepare_image
 from .shell import _run_and_wrap, _wrap_cmd, _peel_rc, _peel_newfiles
 
 
+def _xvfb_run_locked(screen, inner):
+    """`xvfb-run -a` of `inner` (a bash line) under the workdir display lock.
+
+    `xvfb-run -a` picks the first free display number by looking for X locks, then starts
+    Xvfb: two starts at the same instant can pick the same number and the second Xvfb
+    fails. linux_ui_start holds flock on the workdir directory (fd 9) until its display is
+    up; this takes the same lock ("$HOME/<workdir>", the directory linux_ui_start locks as
+    $WD) before xvfb-run and releases it as the first thing inside xvfb-run, i.e. once
+    xvfb-run has seen its Xvfb come up. `flock -u` releases the lock for every fd sharing
+    the open file description (so the Xvfb that inherited fd 9 holds nothing); the program
+    itself gets fd 9 closed. No flock, no workdir or a lock not taken within 30 s: xvfb-run
+    runs anyway (the old behaviour, the collision is then possible again)."""
+    lockdir = '"$HOME"/' + _wd()
+    return ("if [ -d " + lockdir + " ] && command -v flock >/dev/null 2>&1; then "
+            "exec 9<" + lockdir + "; flock -w 30 9; fi 2>/dev/null; "
+            "xvfb-run -a -s " + shlex.quote("-screen 0 " + str(screen)) + " bash -c "
+            + shlex.quote("flock -u 9 2>/dev/null; exec 9<&-; " + inner))
+
+
 def linux_gui_run(command, wait=5, screen="1280x800x24", timeout=60, host=None):
     h, err = hosts.check(host, "linux_gui_run", "linux")
     if err:
@@ -24,8 +43,8 @@ def linux_gui_run(command, wait=5, screen="1280x800x24", timeout=60, host=None):
              "(xdotool search --onlyvisible --name '.' getwindowname %@ 2>/dev/null "
              "| sed 's/^/XWIN /' | head -40); "
              f"import -window root {shlex.quote(shot)} 2>&1 && echo XSHOT_OK")
-    cmd = ("xvfb-run -a -s " + shlex.quote("-screen 0 " + str(screen)) + " bash -c "
-           + shlex.quote(inner))
+    # under the workdir display lock shared with linux_ui_start / linux_gdb (_xvfb_run_locked)
+    cmd = _xvfb_run_locked(screen, inner)
     try:
         res = _run_and_wrap(cmd, host, timeout, f"xvfb({command[:40]})")
         if "XSHOT_OK" not in (res.detail or ""):
@@ -203,8 +222,7 @@ def linux_gdb(prog, script, args="", gui=True, screen="1280x800x24",
                f"--args {shlex.quote(prog_arg)}" + (f" {argstr}" if argstr else ""))
     if gui:
         inner = (f"cd {_wd()} 2>/dev/null; "
-                 "xvfb-run -a -s " + shlex.quote("-screen 0 " + str(screen))
-                 + " bash -c " + shlex.quote(gdb_cmd) + "; echo __GDB_RC=$?")
+                 + _xvfb_run_locked(screen, gdb_cmd) + "; echo __GDB_RC=$?")
     else:
         inner = f"cd {_wd()} 2>/dev/null; " + gdb_cmd + "; echo __GDB_RC=$?"
     cmd = f"bash -c {shlex.quote(inner)}"
@@ -214,7 +232,9 @@ def linux_gdb(prog, script, args="", gui=True, screen="1280x800x24",
                             _GDB_PRELUDE + _GDB_RUN_TAIL.replace("__GDB_USER__", repr(user_name)),
                             host=host)
         remote.write_remote(f"{_wd()}/{user_name}", script, host=host)
-        out, errtxt = remote.ssh_exec(cmd, host=host, read_timeout=timeout + 30)
+        # + 30 s for the display lock wait (flock -w 30) that comes before gdb's own timeout
+        out, errtxt = remote.ssh_exec(cmd, host=host,
+                                      read_timeout=timeout + (60 if gui else 30))
     finally:
         remote.remove_quiet([run_name, user_name], host=host)
     # The `echo __GDB_RC=$?` marker is on STDOUT, as its last line: take the LAST marker

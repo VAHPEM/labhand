@@ -54,7 +54,7 @@ except ImportError as _e1:
             "    pip install \"labhand[mcp]\"\n"
             f"(mcp 1.x import error: {_e1}; mcp 2.x import error: {_e2})")
 
-from . import shell, windows, linux, jobs, utm
+from . import shell, windows, linux, linux_ui, jobs, utm
 
 mcp = _Server("labhand")
 
@@ -240,6 +240,69 @@ def linux_ghidra(path: str, script: str = "", script_name: str = "labhand_ghidra
     return _emit(linux.linux_ghidra(path, script=script, script_name=script_name,
                                     script_args=tuple(script_args or ()), analyze=analyze,
                                     host=host, timeout=timeout, extra=extra))
+
+
+# --- Linux: read / drive a GUI as text through AT-SPI (labhand.linux_ui) ------
+@mcp.tool(annotations=_act("Start a GUI app in a private Xvfb + D-Bus session (Linux host)"))
+def linux_ui_start(command: str, name: str | None = None, screen: str = "1280x800x24",
+                   wait: int = 5, timeout: int = 60, max_minutes: float = 30,
+                   host: str | None = None):
+    """Start `command` (a GUI program) on a linux host under its own Xvfb display and a
+    PRIVATE D-Bus session bus (never the real desktop or bus), with throw-away HOME/XDG dirs
+    and the accessibility switches set (Qt, GTK, Firefox, Java Swing; Chromium also needs
+    --force-renderer-accessibility in `command`). Returns the session name for the other
+    linux_ui_* tools; the session ends by itself after `max_minutes`."""
+    return _emit(linux_ui.linux_ui_start(command, name=name, screen=screen, wait=wait,
+                                         host=host, timeout=timeout, max_minutes=max_minutes))
+
+
+@mcp.tool(annotations=_observe("Read a linux_ui session's accessibility tree as text"))
+def linux_ui_tree(session: str, match: str | None = None, limit: int = 250, depth: int = 30,
+                  showing_only: bool = True, timeout: int = 45, host: str | None = None):
+    """The session's UI as text, one line per element: `#id [role] 'name' (states)
+    actions=... text='...'`. Only showing elements by default (closed menus are not walked);
+    `match` keeps subtrees whose name/role contains it; `limit` caps the lines. Prefer this
+    over screenshots. The #ids are valid for linux_ui_click / linux_ui_type until the next
+    tree of the session."""
+    return _emit(linux_ui.linux_ui_tree(session, match=match, limit=limit, depth=depth,
+                                        showing_only=showing_only, host=host, timeout=timeout))
+
+
+@mcp.tool(annotations=_act("Click / activate an element in a linux_ui session"))
+def linux_ui_click(session: str, target: str, action: str | None = None, timeout: int = 45,
+                   host: str | None = None):
+    """Run an AT-SPI action on an element: `target` = an id from the last linux_ui_tree
+    (`#12`), or a name / `role:name` (e.g. `menu item:About`). Default action: the first of
+    click/press/activate/toggle. Returns the element's state read again afterwards plus the
+    app's windows (the action reports success even when nothing changed: compare)."""
+    return _emit(linux_ui.linux_ui_click(session, target, action=action, host=host,
+                                         timeout=timeout))
+
+
+@mcp.tool(annotations=_act("Type text into an element of a linux_ui session"))
+def linux_ui_type(session: str, text: str, target: str | None = None, enter: bool = False,
+                  timeout: int = 45, host: str | None = None):
+    """Replace the text of `target` (id / name / `role:name`, e.g. `text:`) with `text`:
+    AT-SPI EditableText when it works, else focus + xdotool (web text fields); the text is
+    read back. Without `target`, xdotool types at the keyboard focus. enter=true presses
+    Return afterwards."""
+    return _emit(linux_ui.linux_ui_type(session, text, target=target, enter=enter, host=host,
+                                        timeout=timeout))
+
+
+@mcp.tool(annotations=_observe("Screenshot of a linux_ui session's display"))
+def linux_ui_screenshot(session: str, timeout: int = 30, host: str | None = None):
+    """A picture of the session's Xvfb display, for layout questions the text tree cannot
+    answer."""
+    return _emit(linux_ui.linux_ui_screenshot(session, host=host, timeout=timeout))
+
+
+@mcp.tool(annotations=_act("Stop a linux_ui session / list sessions", idempotent=True,
+                           open_world=False))
+def linux_ui_stop(session: str | None = None, timeout: int = 30, host: str | None = None):
+    """End a linux_ui session: its app, Xvfb, private bus and every child process, and remove
+    its dir. Without `session`: list the live sessions."""
+    return _emit(linux_ui.linux_ui_stop(session=session, host=host, timeout=timeout))
 
 
 # --- Linux: capability triage (raw output; the Brain interprets) ------------
