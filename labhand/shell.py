@@ -3,7 +3,7 @@
 import os, re, shlex, base64, shutil
 from . import remote, config, hosts
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
-from ._result import VMResult, SLICE, _spill, _save_to_host, _find_match  # noqa
+from ._result import VMResult, SLICE, _spill, _save_to_host, _find_match, public_tool  # noqa
 from .output import _clamp_page, SCRATCH_RE
 from .safety import _security_block
 
@@ -91,6 +91,7 @@ def _read_file_one(path, offset=0, length=SLICE, host=None):
                       known=[f"read_file {path}[{offset}:{end}]"], match=flag)
 
 
+@public_tool
 def read_file(path, offset=0, length=SLICE, host=None, pinned_docs=()):
     """Try the host asked for (None: the inventory's default host); if the file is not
     there, try every other host of the inventory, in inventory order, before failing.
@@ -397,6 +398,7 @@ def _run_and_wrap(command, host, timeout, label, grep_shape=None):
 MAX_UPLOAD = 200 * 1024 * 1024
 
 
+@public_tool
 def upload_file(local_path, name=None, host=None):
     """Copy a file from the machine running labhand into a VM's samples/ dir (the working dir of run_cmd /
     run_script). `name` is the path inside samples/ (may hold sub-dirs, e.g. 'data/x.bin'); default: the file's
@@ -452,6 +454,7 @@ def _git_checkout_of(path):
         cur = parent
 
 
+@public_tool
 def download_file(path, dest=None, host=None, overwrite=False, max_bytes=None, timeout=600):
     """Copy a file from a lab host to the machine running labhand (the mirror of upload_file).
 
@@ -561,6 +564,7 @@ def _unlink_quiet(p):
         pass
 
 
+@public_tool
 def run_cmd(command, host=None, timeout=20):
     h, err = hosts.check(host, "run_cmd")
     if err:
@@ -574,6 +578,7 @@ def run_cmd(command, host=None, timeout=20):
                          grep_shape=None if h.is_windows else _grep_shape(command))
 
 
+@public_tool
 def run_script(script, host=None, kind=None, timeout=20, python=None):
     h, err = hosts.check(host, "run_script")
     if err:

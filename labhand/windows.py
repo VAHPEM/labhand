@@ -3,7 +3,7 @@
 import os, re, json, shlex
 from . import remote, hosts
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
-from ._result import VMResult, _spill, _find_match  # noqa
+from ._result import VMResult, _spill, _find_match, public_tool  # noqa
 from .safety import _security_block
 from .images import _prepare_image
 
@@ -101,6 +101,7 @@ def _win_shot_image(label, host, shot):
     return {"media_type": media, "data": b64}, f"screenshot of {label}{note}"
 
 
+@public_tool
 def win_windows(match=None, timeout=40, host=None):
     _h, _err = hosts.check(host, "win_windows", "windows")
     if _err:
@@ -109,10 +110,7 @@ def win_windows(match=None, timeout=40, host=None):
     body = _PS_LIST_WINDOWS
     if match:
         body = body + "\n" + _PS_DEEP_TEXT.replace("__MATCH__", str(match).replace('"', ""))
-    try:
-        text, timed_out = _session1(host, body, timeout=int(timeout))
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"win_windows failed: {e.__class__.__name__}: {e}")
+    text, timed_out = _session1(host, body, timeout=int(timeout))
     if timed_out:
         return VMResult(False, "win_windows: the interactive task did not finish in "
                                  f"{int(timeout)}s (is anyone logged on at the console?)")
@@ -126,6 +124,7 @@ def win_windows(match=None, timeout=40, host=None):
                       match=_find_match(text))
 
 
+@public_tool
 def win_screenshot(timeout=40, host=None):
     _h, _err = hosts.check(host, "win_screenshot", "windows")
     if _err:
@@ -133,10 +132,7 @@ def win_screenshot(timeout=40, host=None):
     host = _h.name
     shot = remote.scratch_name("screen", "png")
     try:
-        try:
-            text, timed_out = _session1(host, _ps_screenshot(shot), timeout=int(timeout))
-        except Exception as e:  # noqa: BLE001
-            return VMResult(False, f"win_screenshot failed: {e.__class__.__name__}: {e}")
+        text, timed_out = _session1(host, _ps_screenshot(shot), timeout=int(timeout))
         if timed_out or "SCREEN " not in text:
             return VMResult(False, f"win_screenshot: capture did not report success - {text[:300]}")
         img, note = _win_shot_image("the Windows desktop", host, shot)
@@ -260,6 +256,7 @@ def _sync_to_windows(win_path, host):
     return True, note
 
 
+@public_tool
 def win_gui_run(program, args="", wait=6, kill=True, screenshot=True, timeout=60, host=None):
     _h, _err = hosts.check(host, "win_gui_run", "windows")
     if _err:
@@ -302,10 +299,7 @@ def win_gui_run(program, args="", wait=6, kill=True, screenshot=True, timeout=60
 
 
 def _win_gui_run_rest(host, body, program, prog, timeout, screenshot, shot, gui_sync_note):
-    try:
-        text, timed_out = _session1(host, body, timeout=int(timeout))
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"win_gui_run failed: {e.__class__.__name__}: {e}")
+    text, timed_out = _session1(host, body, timeout=int(timeout))
     if "NOT_FOUND=" in text:
         return VMResult(False, f"win_gui_run: {prog} is not on the Windows VM - "
                                  "triage uploads artifacts there, or copy it first")
@@ -536,6 +530,7 @@ def _frida_timeout_msg(text, timeout, desktop, wait, driven):
             "problem, not a result)." + hint)
 
 
+@public_tool
 def win_frida(script, program=None, args="", pid=None, wait=8, kill=True,
               desktop=False, max_lines=800, timeout=90,
               drive=None, drive_window=None, drive_pause=250, drive_after=2,
@@ -702,19 +697,16 @@ def _win_frida_run(host, script, program, pid, prog, arglist, wait, kill, deskto
                                  f"{e.__class__.__name__}: {e}")
 
     drv = remote.win_samples(host) + "\\" + drv_name
-    try:
-        if desktop:
-            text, timed_out = _session1(host, 
-                '& "' + remote.python_for(host) + '" "' + drv + '" "' + cfg_name + '" 2>&1',
-                timeout=int(timeout), task="labhand_frida")
-        else:
-            o, e = remote.ssh_exec('"' + remote.python_for(host) + '" "' + drv + '" "'
-                                   + cfg_name + '"',
-                                   host=host, read_timeout=int(timeout) + 30)
-            text = ((o or "") + (e or "")).strip()
-            timed_out = "__FRIDA_END__" not in text
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"win_frida failed: {e.__class__.__name__}: {e}")
+    if desktop:
+        text, timed_out = _session1(host, 
+            '& "' + remote.python_for(host) + '" "' + drv + '" "' + cfg_name + '" 2>&1',
+            timeout=int(timeout), task="labhand_frida")
+    else:
+        o, e = remote.ssh_exec('"' + remote.python_for(host) + '" "' + drv + '" "'
+                               + cfg_name + '"',
+                               host=host, read_timeout=int(timeout) + 30)
+        text = ((o or "") + (e or "")).strip()
+        timed_out = "__FRIDA_END__" not in text
 
     text = _fix_js_lines(text.replace("__FRIDA_END__", "").strip())
     if frida_sync_note:
@@ -951,6 +943,7 @@ public class VmWin32 {
 """
 
 
+@public_tool
 def win_ui_tree(match=None, limit=250, timeout=45, host=None):
     _h, _err = hosts.check(host, "win_ui_tree", "windows")
     if _err:
@@ -977,11 +970,8 @@ foreach ($l in $w32) { Write-Output $l }
 Write-Output ("W32_LINE_COUNT=" + $w32.Count)
 if ($tops.Count -eq 0 -and $w32.Count -eq 0) { Write-Output "NO_WINDOW_MATCHED" }
 """.replace("__LIM__", str(int(limit))).replace("__MATCH__", m)
-    try:
-        text, timed_out = _session1(host, body, timeout=int(timeout),
-                                                 task="labhand_uitree")
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"win_ui_tree failed: {e.__class__.__name__}: {e}")
+    text, timed_out = _session1(host, body, timeout=int(timeout),
+                                             task="labhand_uitree")
     if timed_out:
         return VMResult(False, f"win_ui_tree: no result within {int(timeout)}s")
     if "NO_WINDOW_MATCHED" in text:
@@ -1004,6 +994,7 @@ if ($tops.Count -eq 0 -and $w32.Count -eq 0) { Write-Output "NO_WINDOW_MATCHED" 
                       info=detail, match=_find_match(text))
 
 
+@public_tool
 def win_ui_click(hwnd=None, target=None, window=None, x=None, y=None, after=1,
                  timeout=45, host=None):
     _h, _err = hosts.check(host, "win_ui_click", "windows")
@@ -1067,12 +1058,9 @@ Start-Sleep -Seconds __AFTER__
               .replace("__X__", str(int(x)) if x is not None else "0")
               .replace("__Y__", str(int(y)) if y is not None else "0"))
     what = (f"hwnd={hwnd}" if hw else f"target='{target}'" if t else f"({x},{y})")
-    try:
-        text, timed_out = _session1(host, act + _PS_LIST_WINDOWS,
-                                                 timeout=int(timeout),
-                                                 task="labhand_uiclick")
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"win_ui_click failed: {e.__class__.__name__}: {e}")
+    text, timed_out = _session1(host, act + _PS_LIST_WINDOWS,
+                                             timeout=int(timeout),
+                                             task="labhand_uiclick")
     if timed_out:
         return VMResult(False, f"win_ui_click: no result within {int(timeout)}s")
     if "NOT_FOUND" in text:
@@ -1095,6 +1083,7 @@ Start-Sleep -Seconds __AFTER__
 _SENDKEYS_SPECIAL = "+^%~(){}[]"
 
 
+@public_tool
 def win_ui_type(text, hwnd=None, target=None, window=None, enter=False,
                 sendkeys=False, after=1, timeout=45, host=None):
     _h, _err = hosts.check(host, "win_ui_type", "windows")
@@ -1162,12 +1151,9 @@ Start-Sleep -Seconds __AFTER__
                 .replace("__KEYS__", keys).replace("__AFTER__", str(int(after)))
                 .replace("__ENTER__", "$true" if enter else "$false"))
     where = (f"hwnd={hwnd}" if hw else f"target='{target}'" if t else "the focused control")
-    try:
-        out, timed_out = _session1(host, body + _PS_LIST_WINDOWS,
-                                                timeout=int(timeout),
-                                                task="labhand_uitype")
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"win_ui_type failed: {e.__class__.__name__}: {e}")
+    out, timed_out = _session1(host, body + _PS_LIST_WINDOWS,
+                                            timeout=int(timeout),
+                                            task="labhand_uitype")
     if timed_out:
         return VMResult(False, f"win_ui_type: no result within {int(timeout)}s")
     m = re.search(r"TYPED_[A-Z_]+", out)
@@ -1188,6 +1174,7 @@ Start-Sleep -Seconds __AFTER__
                       info=detail, match=_find_match(out))
 
 
+@public_tool
 def win_key(keys, window=None, after=1, timeout=45, host=None):
     _h, _err = hosts.check(host, "win_key", "windows")
     if _err:
@@ -1224,11 +1211,8 @@ Start-Sleep -Seconds __AFTER__
 """
     body = (body.replace("__WINDOW__", w).replace("__KEYS__", raw)
                 .replace("__AFTER__", str(int(after))))
-    try:
-        out, timed_out = _session1(host, body + _PS_LIST_WINDOWS,
-                                                timeout=int(timeout), task="labhand_key")
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"win_key failed: {e.__class__.__name__}: {e}")
+    out, timed_out = _session1(host, body + _PS_LIST_WINDOWS,
+                                            timeout=int(timeout), task="labhand_key")
     if timed_out:
         return VMResult(False, f"win_key: no result within {int(timeout)}s")
     if "NO_WINDOW_MATCHED" in out:
@@ -1301,6 +1285,7 @@ def _ui_drive_ps(names, window, pause=250, after=2, limit=250):
         .replace("__AFTER__", str(int(after))).replace("__LIM__", str(int(limit)))
 
 
+@public_tool
 def win_ui_seq(clicks, window=None, pause=250, after=2, limit=250, timeout=120, host=None):
     _h, _err = hosts.check(host, "win_ui_seq", "windows")
     if _err:
@@ -1374,11 +1359,8 @@ if ($tops.Count -eq 0) { Write-Output "NO_WINDOW_MATCHED" } else {
 """.replace("__SEQ__", seq).replace("__WINDOW__", w) \
    .replace("__PAUSE__", str(int(pause))).replace("__AFTER__", str(int(after))) \
    .replace("__LIM__", str(int(limit)))
-    try:
-        text, timed_out = _session1(host, body, timeout=int(timeout),
-                                                 task="labhand_uiseq")
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"win_ui_seq failed: {e.__class__.__name__}: {e}")
+    text, timed_out = _session1(host, body, timeout=int(timeout),
+                                             task="labhand_uiseq")
     if timed_out:
         budget = len(names) * int(pause) / 1000.0 + int(after)
         return VMResult(False, f"win_ui_seq: no result within {int(timeout)}s - "

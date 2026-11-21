@@ -3,7 +3,7 @@
 import re, ast, shlex
 from . import remote, hosts
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
-from ._result import VMResult, _spill, _find_match  # noqa
+from ._result import VMResult, _spill, _find_match, public_tool  # noqa
 from .safety import _security_block
 
 
@@ -68,6 +68,7 @@ def _win_job_alive_ps(nm):
             f'    $alive = [bool]($pr -and $pr.CommandLine -and $pr.CommandLine.Contains({_ps_quote(marker)})) }}')
 
 
+@public_tool
 def job_start(name, command=None, script=None, host=None, python=None, truncated=False):
     h, err = hosts.check(host, "job_start")
     if err:
@@ -115,17 +116,14 @@ def job_start(name, command=None, script=None, host=None, python=None, truncated
               f'if ($r.ReturnValue -ne 0) {{ Write-Output ("JOB_CREATE_FAILED=" + $r.ReturnValue) }}\n'
               f'else {{ $r.ProcessId | Out-File -Encoding ascii "{pidf}"\n'
               f'       Write-Output ("JOB_PID=" + $r.ProcessId) }}\n')
-        try:
-            remote.write_remote(f"{_wd()}/_job_{nm}_cmd.txt", inner, host=host)
-            remote.write_remote(f"{_wd()}/{launch}", _WIN_JOB_LAUNCHER, host=host)
-            remote.write_remote(f"{_wd()}/_job_{nm}_start.ps1", ps, host=host)
-            o, e = remote.ssh_exec(
-                f'powershell -NoProfile -ExecutionPolicy Bypass -File '
-                f'"{samples}\\_job_{nm}_start.ps1"',
-                host=host, read_timeout=40)
-            out = ((o or "") + (e or "")).strip()
-        except Exception as e:  # noqa: BLE001
-            return VMResult(False, f"job_start failed: {e.__class__.__name__}: {e}")
+        remote.write_remote(f"{_wd()}/_job_{nm}_cmd.txt", inner, host=host)
+        remote.write_remote(f"{_wd()}/{launch}", _WIN_JOB_LAUNCHER, host=host)
+        remote.write_remote(f"{_wd()}/_job_{nm}_start.ps1", ps, host=host)
+        o, e = remote.ssh_exec(
+            f'powershell -NoProfile -ExecutionPolicy Bypass -File '
+            f'"{samples}\\_job_{nm}_start.ps1"',
+            host=host, read_timeout=40)
+        out = ((o or "") + (e or "")).strip()
     else:
         interp = python or h.python
         inner = (f"{shlex.quote(interp)} -u {pyf}" if script else command)
@@ -136,12 +134,9 @@ def job_start(name, command=None, script=None, host=None, python=None, truncated
               f"echo $! > {pidf}\n"
               "sleep 0.4\n"
               f"echo JOB_PID=$(cat {pidf})\n")
-        try:
-            o, e = remote.ssh_exec(f"bash -c {shlex.quote(sh)}", host=host,
-                                   read_timeout=40)
-            out = ((o or "") + (e or "")).strip()
-        except Exception as e:  # noqa: BLE001
-            return VMResult(False, f"job_start failed: {e.__class__.__name__}: {e}")
+        o, e = remote.ssh_exec(f"bash -c {shlex.quote(sh)}", host=host,
+                               read_timeout=40)
+        out = ((o or "") + (e or "")).strip()
 
     m = re.search(r"JOB_PID=(\d+)", out)
     if not m:
@@ -154,20 +149,18 @@ def job_start(name, command=None, script=None, host=None, python=None, truncated
                       known=[f"job '{nm}' running on {host}, pid {pid}, log {_wd()}/{log}"])
 
 
+@public_tool
 def job_poll(name=None, tail=40, grep=None, stop=False, host=None):
     h, err = hosts.check(host, "job_poll")
     if err:
         return err
     host = h.name
     if name is None:
-        try:
-            cmd = (f'dir /b "{remote.win_samples(host)}\\_job_*.log"' if h.is_windows else
-                   f"cd {_wd()} 2>/dev/null && ls -la _job_*.log 2>/dev/null | head -40 "
-                   "|| echo 'no jobs'")
-            o, e = remote.ssh_exec(cmd if h.is_windows else f"bash -c {shlex.quote(cmd)}",
-                                   host=host, read_timeout=30)
-        except Exception as ex:  # noqa: BLE001
-            return VMResult(False, f"job_poll failed: {ex.__class__.__name__}: {ex}")
+        cmd = (f'dir /b "{remote.win_samples(host)}\\_job_*.log"' if h.is_windows else
+               f"cd {_wd()} 2>/dev/null && ls -la _job_*.log 2>/dev/null | head -40 "
+               "|| echo 'no jobs'")
+        o, e = remote.ssh_exec(cmd if h.is_windows else f"bash -c {shlex.quote(cmd)}",
+                               host=host, read_timeout=30)
         txt = ((o or "") + (e or "")).strip() or "no jobs"
         return VMResult(True, "jobs on " + host, detail=txt[:1500], info=txt[:1500])
 
@@ -204,15 +197,12 @@ def job_poll(name=None, tail=40, grep=None, stop=False, host=None):
             ps.append(f'  $c | Select-Object -Last {n}')
         ps.append('}')
         body = "\n".join(ps)
-        try:
-            remote.write_remote(f"{_wd()}/_job_{nm}_poll.ps1", body, host=host)
-            o, e = remote.ssh_exec(
-                f'powershell -NoProfile -ExecutionPolicy Bypass -File '
-                f'"{remote.win_samples(host)}\\_job_{nm}_poll.ps1"',
-                host=host, read_timeout=45)
-            txt = ((o or "") + (e or "")).strip()
-        except Exception as ex:  # noqa: BLE001
-            return VMResult(False, f"job_poll failed: {ex.__class__.__name__}: {ex}")
+        remote.write_remote(f"{_wd()}/_job_{nm}_poll.ps1", body, host=host)
+        o, e = remote.ssh_exec(
+            f'powershell -NoProfile -ExecutionPolicy Bypass -File '
+            f'"{remote.win_samples(host)}\\_job_{nm}_poll.ps1"',
+            host=host, read_timeout=45)
+        txt = ((o or "") + (e or "")).strip()
     else:
         parts = [f"cd {_wd()} 2>/dev/null || exit 9",
                  f'[ -f {log} ] || {{ echo NO_SUCH_JOB; exit 0; }}',
@@ -234,12 +224,9 @@ def job_poll(name=None, tail=40, grep=None, stop=False, host=None):
             parts.append(f'echo "--- last {n} lines ---"')
             parts.append(f'tail -n {n} {log}')
         sh = "\n".join(parts)
-        try:
-            o, e = remote.ssh_exec(f"bash -c {shlex.quote(sh)}", host=host,
-                                   read_timeout=60)
-            txt = ((o or "") + (e or "")).strip()
-        except Exception as ex:  # noqa: BLE001
-            return VMResult(False, f"job_poll failed: {ex.__class__.__name__}: {ex}")
+        o, e = remote.ssh_exec(f"bash -c {shlex.quote(sh)}", host=host,
+                               read_timeout=60)
+        txt = ((o or "") + (e or "")).strip()
 
     if "NO_SUCH_JOB" in txt:
         return VMResult(False, f"job_poll: no job named '{nm}' on {host} - "

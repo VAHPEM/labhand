@@ -41,7 +41,7 @@ import time
 
 from . import hosts, remote
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
-from ._result import VMResult
+from ._result import VMResult, public_tool
 
 UTMCTL_DEFAULT = "/Applications/UTM.app/Contents/MacOS/utmctl"
 SNAPSHOT_NEEDS = ("utmctl snapshot needs UTM >= 5.0.6 and, for a QEMU VM, macOS 26 "
@@ -111,6 +111,7 @@ def _status(vm):
     return (out.strip().splitlines() or [""])[-1].strip().lower(), out
 
 
+@public_tool
 def vm_status(host=None, vm=None):
     """The UTM state of a host's VM (utmctl status)."""
     name, vmn, err = _vm(host, "vm_status", vm)
@@ -286,6 +287,7 @@ def _sync(host):
         pass
 
 
+@public_tool
 def vm_stop(host=None, how="request", timeout=180, vm=None, check_jobs=True):
     """Stop a host's VM. how="request": a clean shutdown - the guest is asked over SSH
     (shutdown /s; systemctl poweroff), and UTM sends an ACPI power-button event; if the
@@ -334,6 +336,7 @@ def vm_stop(host=None, how="request", timeout=180, vm=None, check_jobs=True):
     return VMResult(True, f"stopped {name} ({vmn}) with --{how}", known=[f"{vmn} stopped"])
 
 
+@public_tool
 def vm_start(host=None, disposable=False, timeout=300, vm=None):
     """Start a host's VM (disposable=True: as a snapshot whose disk writes are discarded
     when it stops) and wait until SSH answers."""
@@ -364,6 +367,7 @@ def vm_start(host=None, disposable=False, timeout=300, vm=None):
                     known=[f"{vmn} started, {kind}"])
 
 
+@public_tool
 def vm_revert(host=None, timeout=300, vm=None):
     """Back to the saved disk: stop the VM, then start a new disposable session and wait for
     SSH. A session labhand started as disposable is powered off (it keeps nothing anyway);
@@ -421,6 +425,7 @@ def _remember(vm, name, add):
     os.replace(tmp, _REGISTRY)
 
 
+@public_tool
 def vm_snapshot(action, host=None, name=None, vm=None):
     """action: list | create | restore | delete, over `utmctl snapshot`. restore / delete
     only act on snapshots labhand created (recorded in ~/.labhand/utm-snapshots.json)."""
@@ -441,10 +446,7 @@ def vm_snapshot(action, host=None, name=None, vm=None):
     if action == "restore":
         st, _ = _status(vmn)
         if st == "started":
-            try:
-                running = _running_jobs(hname)
-            except Exception as e:  # noqa: BLE001
-                return VMResult(False, f"{tool}: {e}")
+            running = _running_jobs(hname)    # raises -> public_tool: ok=False naming the host
             if running:
                 return VMResult(False, f"{tool}: background job(s) running or of unknown state on {hname}: "
                                        f"{', '.join(running)}")

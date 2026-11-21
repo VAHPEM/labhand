@@ -3,7 +3,7 @@
 import base64, re, shlex, uuid
 from . import remote, hosts
 from .hosts import workdir as _wd, workdir_win as _wdw  # noqa: F401
-from ._result import VMResult, _spill, _find_match  # noqa
+from ._result import VMResult, _spill, _find_match, public_tool  # noqa
 from .safety import _security_block
 from .images import _prepare_image
 from .shell import _run_and_wrap, _wrap_cmd, _peel_rc, _peel_newfiles
@@ -28,6 +28,7 @@ def _xvfb_run_locked(screen, inner):
             + shlex.quote("flock -u 9 2>/dev/null; exec 9<&-; " + inner))
 
 
+@public_tool
 def linux_gui_run(command, wait=5, screen="1280x800x24", timeout=60, host=None):
     h, err = hosts.check(host, "linux_gui_run", "linux")
     if err:
@@ -180,6 +181,7 @@ _GDB_RUN_TAIL = (
 )
 
 
+@public_tool
 def linux_gdb(prog, script, args="", gui=True, screen="1280x800x24",
               max_lines=800, timeout=120, host=None):
     h, err = hosts.check(host, "linux_gdb", "linux")
@@ -327,6 +329,7 @@ def _missing_tool_note(res, tool, hint):
     return res
 
 
+@public_tool
 def linux_capa(path, host=None, timeout=120, extra=""):
     """Run `capa` on a linux host against `path` (relative to the host workdir) and return
     the RAW VMResult: capa's stdout/stderr unchanged. No interpretation."""
@@ -351,6 +354,7 @@ _YARA_ENGINES = {                    # engine -> (command prefix, tool name, ins
 }
 
 
+@public_tool
 def linux_yara(rules, target, host=None, timeout=60, extra="", engine="yara"):
     """Run `yara <rules> <target>` on a linux host (paths relative to the host workdir) and
     return the RAW VMResult: yara's stdout/stderr unchanged. No interpretation.
@@ -375,6 +379,7 @@ def linux_yara(rules, target, host=None, timeout=60, extra="", engine="yara"):
     return _missing_tool_note(res, tool, hint)
 
 
+@public_tool
 def linux_vol(image, plugin, host=None, timeout=300, extra="", vol_opts=""):
     """Run Volatility 3 (`vol <vol_opts> -f <image> <plugin> <extra>`) on a linux host
     (`image` relative to the host workdir) and return the RAW VMResult: vol's stdout/stderr
@@ -572,6 +577,7 @@ def _ghidra_block(path, script, script_name, script_args, analyze, timeout, opts
     return "\n".join(lines)
 
 
+@public_tool
 def linux_ghidra(path, script="", script_name="labhand_ghidra.py", script_args=(),
                  analyze=True, host=None, timeout=300, extra=""):
     """Run Ghidra's analyzeHeadless on a linux host: import `path` (relative to the host

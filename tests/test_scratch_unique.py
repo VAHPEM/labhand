@@ -171,8 +171,8 @@ def test_scratch_unique_shell_run_script_linux(lab, kind, ext, runner):
     lab.respond = lambda h, c: ("__RC=124", "")
     assert not shell.run_script("sleep 99", host="kali", kind=kind).ok
     lab.respond = _boom
-    with pytest.raises(EOFError):
-        shell.run_script("echo x", host="kali", kind=kind)
+    r = shell.run_script("echo x", host="kali", kind=kind)         # a lost connection is ok=False (public_tool), not a raise
+    assert not r.ok and "EOFError: connection lost" in r.summary, r.summary
     assert fs.scratch_left() == []
     assert len({p for p in fs.written}) == len(fs.written) == 4
 
@@ -209,8 +209,8 @@ def test_scratch_unique_win_run_cmd(lab):
     lab.respond = lambda h, c: ("__TIMEOUT_KILLED__\n__RC=124", "")
     assert not shell.run_cmd("ping -n 99 x", host="windows").ok
     lab.respond = _boom
-    with pytest.raises(EOFError):
-        shell.run_cmd("echo x", host="windows")
+    r = shell.run_cmd("echo x", host="windows")         # a lost connection is ok=False (public_tool), not a raise
+    assert not r.ok and "EOFError: connection lost" in r.summary, r.summary
     assert lab.fs["windows"].scratch_left() == []
 
 
@@ -231,8 +231,8 @@ def test_scratch_unique_win_run_script(lab, kind, ext):
     assert scripts[0][0] != scripts[1][0]
     assert [s for _, s in scripts] == ["Write-Output 1", "Write-Output 2"]
     lab.respond = _boom
-    with pytest.raises(EOFError):
-        shell.run_script("x", host="windows", kind=kind)
+    r = shell.run_script("x", host="windows", kind=kind)         # a lost connection is ok=False (public_tool), not a raise
+    assert not r.ok and "EOFError: connection lost" in r.summary, r.summary
     assert fs.scratch_left() == []
 
 
@@ -300,8 +300,8 @@ def test_scratch_unique_linux_gdb(lab):
     lab.respond = lambda h, c: ("__GDB_RC=124", "")
     assert not linux.linux_gdb("a.out", "run()", host="kali").ok
     lab.respond = _boom
-    with pytest.raises(EOFError):
-        linux.linux_gdb("a.out", "run()", host="kali")
+    r = linux.linux_gdb("a.out", "run()", host="kali")         # a lost connection is ok=False (public_tool), not a raise
+    assert not r.ok and "EOFError: connection lost" in r.summary, r.summary
     assert fs.scratch_left() == []
 
 

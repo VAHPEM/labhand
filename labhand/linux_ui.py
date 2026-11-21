@@ -47,7 +47,7 @@ import time
 
 from . import remote, hosts
 from .hosts import workdir as _wd
-from ._result import VMResult, _spill, _find_match
+from ._result import VMResult, _spill, _find_match, public_tool
 from .safety import _security_block
 from .images import _prepare_image
 
@@ -1309,6 +1309,7 @@ def _stop_quiet(host, session):
 
 
 # --- the tools ------------------------------------------------------------------------------
+@public_tool
 def linux_ui_start(command, name=None, screen="1280x800x24", wait=5, host=None, timeout=60,
                    max_minutes=30):
     """Start `command` on a linux host under its own Xvfb display and private D-Bus session
@@ -1349,7 +1350,7 @@ def linux_ui_start(command, name=None, screen="1280x800x24", wait=5, host=None, 
                                                       wait, driver, meta), timeout)
     except Exception as e:  # noqa: BLE001
         _stop_quiet(host, session)
-        return VMResult(False, f"{tool}: {type(e).__name__}: {e} (session {session} torn down)")
+        return VMResult(False, f"{tool} on {host}: {type(e).__name__}: {e} (session {session} torn down)")
     finally:
         remote.remove_quiet([driver], host=host)
     # App output and driver text are neutralised on the host (no line of theirs starts with
@@ -1409,8 +1410,6 @@ def _drive(tool, session, args, host, timeout, default_timeout):
     try:
         remote.write_remote(f"{_wd()}/{driver}", _driver_source(args), host=h.name)
         text, rc, timed_out = _exec(h.name, _drive_body(s, driver), timeout)
-    except Exception as e:  # noqa: BLE001
-        return None, VMResult(False, f"{tool}: {type(e).__name__}: {e}"), None
     finally:
         remote.remove_quiet([driver], host=h.name)
     if _flag(text, "UNKNOWN") or _flag(text, "STARTING"):
@@ -1430,6 +1429,7 @@ def _drive(tool, session, args, host, timeout, default_timeout):
     return (h.name, s, drc, rc), None, _clean(text)
 
 
+@public_tool
 def linux_ui_tree(session, match=None, limit=250, depth=30, showing_only=True, host=None,
                   timeout=45):
     """The session's accessibility tree as text, one line per element: `#id [role] 'name'
@@ -1454,6 +1454,7 @@ def linux_ui_tree(session, match=None, limit=250, depth=30, showing_only=True, h
                     detail=detail, known=known, match=_find_match(text), info=detail)
 
 
+@public_tool
 def linux_ui_click(session, target, action=None, host=None, timeout=45):
     """Run an AT-SPI action on one element: `target` = an id from the last linux_ui_tree
     (`#12`), or a name / `role:name` (exact name first, then prefix; showing elements win;
@@ -1478,6 +1479,7 @@ def linux_ui_click(session, target, action=None, host=None, timeout=45):
                     detail=detail, known=known, match=_find_match(text), info=detail)
 
 
+@public_tool
 def linux_ui_type(session, text, target=None, enter=False, host=None, timeout=45):
     """Put `text` into an element: EditableText.set_text_contents when it has that interface,
     else (or when the read-back differs, as in Firefox) grab_focus + xdotool select-all +
@@ -1502,6 +1504,7 @@ def linux_ui_type(session, text, target=None, enter=False, host=None, timeout=45
                     detail=detail, known=known, match=_find_match(out), info=detail)
 
 
+@public_tool
 def linux_ui_screenshot(session, host=None, timeout=30):
     """A picture of the session's display (r.image), for what text cannot show (layout)."""
     tool = "linux_ui_screenshot"
@@ -1526,8 +1529,6 @@ def linux_ui_screenshot(session, host=None, timeout=30):
                                    + (f" (TIMEOUT after {timeout}s)" if timed_out else "")
                                    + f": {_clean(text)[:400]}")
         raw = remote.read_bytes(f"{_wd()}/{shot}", host=h.name)
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"{tool}: {type(e).__name__}: {e}")
     finally:
         remote.remove_quiet([shot], host=h.name)
     media, b64, note = _prepare_image(raw, "png")
@@ -1539,6 +1540,7 @@ def linux_ui_screenshot(session, host=None, timeout=30):
                     image={"media_type": media, "data": b64})
 
 
+@public_tool
 def linux_ui_stop(session=None, host=None, timeout=30):
     """End a session: its app, Xvfb, private bus and every other process carrying its marker
     (TERM, then KILL), then remove its dir. Without `session`: list the live sessions (and
@@ -1549,10 +1551,7 @@ def linux_ui_stop(session=None, host=None, timeout=30):
         return err
     timeout = _int(timeout, 30, lo=5, hi=600)
     if session in (None, ""):
-        try:
-            text, rc, timed_out = _exec(h.name, _LIST_BODY, timeout)
-        except Exception as e:  # noqa: BLE001
-            return VMResult(False, f"{tool}: {type(e).__name__}: {e}")
+        text, rc, timed_out = _exec(h.name, _LIST_BODY, timeout)
         if timed_out or rc != 0:
             return VMResult(False, f"{tool}: listing failed on {h.name} (exit {rc})",
                             detail=_clean(text))
@@ -1560,10 +1559,7 @@ def linux_ui_stop(session=None, host=None, timeout=30):
     s, err = _session_arg(session, tool)
     if err:
         return err
-    try:
-        text, rc, timed_out = _exec(h.name, _stop_body(s), timeout)
-    except Exception as e:  # noqa: BLE001
-        return VMResult(False, f"{tool}: {type(e).__name__}: {e}")
+    text, rc, timed_out = _exec(h.name, _stop_body(s), timeout)
     if _flag(text, "UNKNOWN"):
         return _unknown(tool, s, h.name, text)
     if timed_out:

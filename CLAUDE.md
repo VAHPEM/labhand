@@ -104,7 +104,7 @@ connection. Every `win_*` / `linux_*` call below also takes `host=None`.
 ### Windows instrumentation — `labhand.windows`
 | call | does |
 |---|---|
-| `win_frida(script, program=None, pid=None, args="", wait=8, kill=True, desktop=False, max_lines=800, timeout=90, drive=None, launch=None, bat_text="", bat_names=())` | run a **Frida** JavaScript hook: spawn by `program`, attach by `pid`, or `launch` a `.bat` GUI app; returns every `send()`/`log()` line. `drive=` presses UI buttons while hooked. |
+| `win_frida(script, program=None, pid=None, args="", wait=8, kill=True, desktop=False, max_lines=800, timeout=90, drive=None, launch=None, bat_text="", bat_names=())` | run a **Frida** JavaScript hook: spawn by `program`, attach by `pid`, or `launch` a `.bat` GUI app; returns every `send()`/`log()` line. `drive=` presses UI buttons while hooked. The Windows VM's Python and frida 17.18 are **x64 builds under emulation**: only x64 targets can be hooked, a native ARM64 target (e.g. the ARM64 notepad) cannot (measured 2026-11-21). |
 
 ### Linux — headless GUI & debugger — `labhand.linux`
 | call | does |
@@ -238,6 +238,15 @@ The server registers as `labhand`. See `labhand/mcp_server.py`.
   call run another's script (found 2026-11-20). `tests/test_scratch_unique.py`.
 - **One pooled SSH connection per host**, reused; a network blip is retried here, not
   surfaced as a failure.
+- **A failure is a `VMResult(ok=False)`, never an exception.** Every public tool (each MCP
+  tool and the same function called as a library) is decorated with
+  `labhand._result.public_tool`: an `Exception` that escapes it (host unreachable, SSH/SFTP
+  session broken: OSError incl. socket timeouts, paramiko errors, EOFError; or any other
+  unexpected error) comes back as `ok=False`, summary `<tool> on <host>: <ExcClass>: <message>`,
+  the traceback tail in `detail`. `KeyboardInterrupt` / `SystemExit` still propagate. A result
+  the tool returns itself (its own `ok=False` wording, `waiting`, `image`) is passed through
+  untouched; the retry ladder above runs first. Decorate every new public tool;
+  `tests/test_conn_fail.py` enumerates the MCP server's tools and fails on one that raises.
 - **The lab is free-action; network isolation is the boundary.** Security/system
   configuration on the VMs (Defender, firewall, registry, services, ACLs, accounts,
   `cipher`, a root shell) may be changed freely. The `labhand.safety` filter refuses
